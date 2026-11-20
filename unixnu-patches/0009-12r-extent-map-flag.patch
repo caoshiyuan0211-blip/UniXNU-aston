@@ -1,0 +1,15 @@
+diff --git a/scripts/build-sheng-source-storage.py b/scripts/build-sheng-source-storage.py
+index f7fef50..b13a278 100644
+--- a/scripts/build-sheng-source-storage.py
++++ b/scripts/build-sheng-source-storage.py
+@@ -189,6 +189,10 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
+                 '-I', str(ROOT / 'drivers/VirtioMmioBlock'), '-I', str(tree / '.cache/xnu-work/osfmk')]
+     flags = ['-DNATIVE_UFS_SOURCE_API=1', '-DNATIVE_VERIFIED_BLOCK=1',
+              '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-DNATIVE_VERIFIED_POLICY_HANDOFF=1']
++    # OnePlus 12R: the iOS disk is a pinned file inside Android's userdata (drivers/ShengUfs/ExtentMap.h). A device
++    # repository that carries the generated ExtentTable.h gets the extent layer; boot-arg unixnu-extent=1 then enables it.
++    if (device / 'drivers/ShengUfs/ExtentTable.h').is_file():
++        flags.append('-DSHENG_UFS_EXTENT_MAP=1')
+     if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx':
+         # The kernel keeps the iOS target triple, so TargetConditionals gives TARGET_OS_OSX 0. The macOS
+         # IOStorageFamily has the TARGET_OS_OSX members (doLockUnlockMedia, reportLockability,

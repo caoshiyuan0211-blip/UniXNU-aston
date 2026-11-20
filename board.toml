@@ -106,6 +106,9 @@ panic_screen = true
 kernel_args = [
   "-v", "serial=3", "debug=0x14e", "kt_fixed_zones=120", "-no_slto_panic", "use_contiguous_hint=0",
   "native-source-storage=1", "native-ufs-root=1",
+  # OnePlus 12R (branch oneplus-12r-extent): root, Data and log live in the pinned file /data/unixnu/ios.img inside Android's
+  # userdata, through drivers/ShengUfs/ExtentMap.h + ExtentTable.h, instead of a "unixnu" partition. Run 12r/preboot-check.sh first.
+  "unixnu-extent=1",
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1",
