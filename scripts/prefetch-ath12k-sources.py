@@ -10,6 +10,7 @@ content checks and its `add`. Existing checkouts are left alone.
 usage: prefetch-ath12k-sources.py ATH12K_WIFI_DIR
 """
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +35,19 @@ def main():
         git('-C', str(directory), 'sparse-checkout', 'set', '--no-cone', *source['paths'])
         git('-C', str(directory), 'read-tree', '-mu', 'HEAD')
         head = subprocess.run(['git', '-C', str(directory), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        if head != source['commit']:
+            # A release branch (FreeBSD releng/15.1) moves on after the lock was written: start again with only the locked
+            # commit, in a fresh pattern-mode sparse repository (a checkout over the first clone leaves the sparse paths empty).
+            shutil.rmtree(directory)
+            git('init', '-q', str(directory))
+            git('-C', str(directory), 'remote', 'add', 'origin', source['url'])
+            git('-C', str(directory), 'config', 'remote.origin.promisor', 'true')
+            git('-C', str(directory), 'config', 'remote.origin.partialclonefilter', 'blob:none')
+            git('-C', str(directory), 'sparse-checkout', 'set', '--no-cone', *source['paths'])
+            git('-C', str(directory), 'fetch', '-q', '--depth', '1', '--filter=blob:none', 'origin', source['commit'])
+            git('-C', str(directory), '-c', 'advice.detachedHead=false', 'checkout', '-q', 'FETCH_HEAD')
+            head = subprocess.run(['git', '-C', str(directory), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+            print(f'{name}: {source["ref"]} moved on; using the locked commit {head}')
         if head != source['commit']:
             raise SystemExit(f'{name}: {source["ref"]} is {head}, the lock expects {source["commit"]}')
         missing = [path for path in source['required'] if not (directory / path).is_file()]
