@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #pragma once
 // Shared production parser. Requires hostRead4k, SHA256, diagnostics and C memory primitives.
+#include "ExtentMap.h"
 // ---- LUN 0 GPT and the root-image manifest -------------------------------------------------
 struct RootWindow {
   char name[32];
@@ -62,6 +63,16 @@ static bool findRootLayout (RootLayout *layout, const char **why)
 {
   gRootDiagnostic.stage = "GPT header";
   bzero (layout, sizeof (*layout));
+#if defined(SHENG_UFS_EXTENT_MAP) && SHENG_UFS_EXTENT_MAP
+  {
+    uint32_t extent = 0;   // boot-arg unixnu-extent=1: the root is the pinned file of ExtentTable.h (OnePlus 12R)
+    extentModeDecide (PE_parse_boot_argn ("unixnu-extent", &extent, sizeof (extent)) && extent == 1);
+    if (extent == 1 && !extentModeOn ()) {
+      *why = gExtentWhy;   // asked for, but the table is unusable: stop rather than fall back to a partition search
+      return false;
+    }
+  }
+#endif
   if (hostRead4k (0, 1, 1, gScratch) != kIOReturnSuccess) {
     *why = "GPT header read";
     return false;
@@ -111,7 +122,12 @@ static bool findRootLayout (RootLayout *layout, const char **why)
 #ifndef SHENG_UFS_ROOT_PARTITION
 #define SHENG_UFS_ROOT_PARTITION "unixnu"
 #endif
-  static const char wanted[] = SHENG_UFS_ROOT_PARTITION;
+  // Extent mode (OnePlus 12R, ExtentMap.h): there is no "unixnu" partition. Match Android's "userdata" instead, only to prove
+  // that it is still exactly the partition the extent table was made from; it is never read or written as such.
+  static const char wantedPartition[] = SHENG_UFS_ROOT_PARTITION;
+  static const char wantedHost[] = "userdata";
+  const char *wanted = extentModeOn () ? wantedHost : wantedPartition;
+  const unsigned wantedBytes = extentModeOn () ? sizeof (wantedHost) : sizeof (wantedPartition);
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -129,7 +145,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
     }
     bool match = true;
-    for (unsigned c = 0; c < sizeof (wanted); c++) {
+    for (unsigned c = 0; c < wantedBytes; c++) {
       if (entry[56 + 2 * c] != static_cast<uint8_t> (wanted[c]) || entry[57 + 2 * c] != 0) {
         match = false;
         break;
@@ -146,8 +162,17 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     }
   }
   if (!found || layout->userdataLast < layout->userdataFirst) {
-    *why = "no " SHENG_UFS_ROOT_PARTITION " partition";
+    *why = extentModeOn () ? "no userdata partition" : "no " SHENG_UFS_ROOT_PARTITION " partition";
     return false;
+  }
+  if (extentModeOn ()) {
+    if (layout->userdataFirst != kExtentHostFirst || layout->userdataLast != kExtentHostLast) {
+      *why = "userdata changed since the extent table was made";
+      return false;
+    }
+    // From here on the "partition" is the virtual one: every LBA below is translated by hostRead4k/hostWrite4k.
+    layout->userdataFirst = kExtentVirtualBase;
+    layout->userdataLast = kExtentVirtualBase + kExtentTotalBlocks - 1;
   }
   gRootDiagnostic.first = layout->userdataFirst;
   gRootDiagnostic.last = layout->userdataLast;

@@ -4,8 +4,8 @@
     "files": {
       "qcom/sm8550/aston/a740_zap.mbn": {
         "bytes": 12088,
-        "sha256": "39dad2d75b234c2664a3d8435d32debc50c933825056e6badf40eb409e8a8bbb",
-        "source": "PJE110 ColorOS 15.0.0.870(CN01) vendor_b /firmware/a740_zap.mbn (read from the erofs image dumped in TWRP, 2026-11-08); its three segments equal a740_zap.mdt + .b00-.b02 joined (they differ only in padding)"
+        "sha256": "af82e301b65f0c32e7f0c06d629d524ba46988ffd5f438aef70ddaa62b769344",
+        "source": "OnePlus 12R CPH2611 OxygenOS CPH2611_14.0.0.831(EX01) /vendor/firmware/a740_zap.mbn, read as root over adb on 2026-11-19 (12r/collect-12r-info.sh); same size as the Ace 3 image, different signature"
       }
     }
   }

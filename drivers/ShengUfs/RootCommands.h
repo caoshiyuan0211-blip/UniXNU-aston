@@ -237,8 +237,9 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
   return kIOReturnSuccess;
 }
 
-// Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
-static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
+// Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at the REAL `lba` into dst.
+// Only hostRead4k() below calls this; it translates virtual LBAs in extent mode (ExtentMap.h).
+static IOReturn hostRead4kPhys (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
@@ -254,6 +255,19 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   }
   IOLockUnlock (gHost.lock);
   return status;
+}
+
+#include "ExtentMap.h"
+
+// Read `blocks` 4096-byte blocks starting at `lba` into dst. In extent mode, LUN 0 LBAs at or above kExtentVirtualBase are
+// virtual and are split into the physical runs of the pinned file; real LBAs below it stay readable (GPT checks).
+static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
+{
+  if (lun != 0 || !extentModeOn ()) return hostRead4kPhys (lun, lba, blocks, dst);
+  if (!dst || !blocks || blocks > kDataMax / 4096) return kIOReturnBadArgument;
+  return extentForEach (lba, blocks, true, [&] (uint64_t physical, uint32_t run, uint64_t offset) {
+    return hostRead4kPhys (0, physical, run, static_cast<uint8_t *> (dst) + offset);
+  });
 }
 
 // ---- Persistent store and log windows ------------------------------------------------------------------------------
@@ -311,10 +325,15 @@ static void hostUnlock (bool held)
   if (held) IOLockUnlock (gHost.lock);
 }
 
-// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
-static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+// WRITE(10) of `blocks` 4096-byte blocks from src to the REAL lba on LUN 0. Without extent mode the range must lie inside one
+// open window. In extent mode only hostWrite4k() calls this, after checking the window in virtual LBAs and translating;
+// the physical run must then lie inside the userdata partition the table was made for (a second, independent fence).
+static IOReturn hostWrite4kPhys (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0) return kIOReturnBadArgument;
+  if (extentModeOn ()) {
+    if (lba < kExtentHostFirst || lba > kExtentHostLast || blocks - 1 > kExtentHostLast - lba) return kIOReturnNotPermitted;
+  } else if (!hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
   const bool held = hostLock ();
@@ -326,6 +345,19 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   IOReturn status = hostScsiDir (0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
   hostUnlock (held);
   return status;
+}
+
+// WRITE of `blocks` 4096-byte blocks from src to `lba` on LUN 0; the range must lie inside one open window. In extent mode
+// the window is checked in virtual LBAs, only virtual LBAs are writable, and the write is split into physical runs.
+static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+{
+  if (!extentModeOn ()) return hostWrite4kPhys (lun, lba, blocks, src, fua);
+  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+    return kIOReturnBadArgument;
+  }
+  return extentForEach (lba, blocks, false, [&] (uint64_t physical, uint32_t run, uint64_t offset) {
+    return hostWrite4kPhys (0, physical, run, static_cast<const uint8_t *> (src) + offset, fua);
+  });
 }
 
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.

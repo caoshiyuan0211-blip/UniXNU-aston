@@ -1,0 +1,15 @@
+diff --git a/scripts/build-sheng-source-storage.py b/scripts/build-sheng-source-storage.py
+index 0659e36..d009acd 100644
+--- a/scripts/build-sheng-source-storage.py
++++ b/scripts/build-sheng-source-storage.py
+@@ -187,6 +187,10 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
+                 '-I', str(ROOT / 'drivers/VirtioMmioBlock'), '-I', str(tree / '.cache/xnu-work/osfmk')]
+     flags = ['-DNATIVE_UFS_SOURCE_API=1', '-DNATIVE_VERIFIED_BLOCK=1',
+              '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1', '-DNATIVE_VERIFIED_POLICY_HANDOFF=1']
++    # OnePlus 12R: the iOS disk is a pinned file inside Android's userdata (drivers/ShengUfs/ExtentMap.h). A device
++    # repository that carries the generated ExtentTable.h gets the extent layer; boot-arg unixnu-extent=1 then enables it.
++    if (device / 'drivers/ShengUfs/ExtentTable.h').is_file():
++        flags.append('-DSHENG_UFS_EXTENT_MAP=1')
+     # The RAM disk carries the Data seed; like NativeUfs its class registers with the source storage classes.
+     sources = [base, device / 'drivers/ShengUfs/NativeUfs.cpp', ROOT / 'drivers/RamBlock/NativeRamBlock.cpp',
+                device_source('SourceStorage.cpp'), device_source('SourceRootPolicies.cpp'),
