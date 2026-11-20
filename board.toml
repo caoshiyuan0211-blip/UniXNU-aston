@@ -80,10 +80,26 @@ roots = [
 ]
 
 [firmware]
-# Not used: the Ace 3 firmware is Mu-Silicium "aston", built by Ace3-UniXNU/scripts/build-ram-probe.sh.
+# OnePlus 12R: upstream Mu-Silicium astonPkg at 6b3d90b7 (the revision Ace3-UniXNU built from) plus the UniXNU modules
+# (branch unixnu-12r of ~/12r-unixnu/Mu-Silicium-full: UniXNU app and Dxe, UniXNURamDiskDxe, DarwinBoot, UniXNULib, FdtLib,
+# as uefi-sheng). Built with: ./unixnu build firmware --uefi <Mu-Silicium> --edk2 <Mu-Silicium>/Mu_Basecore
+# The package paths and defines are those of astonPkg/DeviceBuild.py; DEVICE_MODEL 1 is the 12R (SMBIOS strings only).
 config = "aston"
-dsc = "Platforms/OnePlus/astonPkg/aston.dsc"
+dsc = "astonPkg/aston.dsc"
 fd = "Build/astonPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+packages = ["{uefi}/Platforms/OnePlus", "{uefi}/Common/Mu", "{uefi}/Common/Mu_OEM_Sample", "{edk2}", "{uefi}/Silicon/Qualcomm",
+            "{uefi}/Silicon/Silicium", "{uefi}/Silicium-ACPI", "{uefi}/Silicium-ACPI/Platforms/OnePlus",
+            "{uefi}/Silicium-ACPI/Silicon/Qualcomm", "{uefi}", "{tree}/package", "{tree}/drivers/DarwinBoot"]
+# build_uefi.py applies these to Mu_Basecore before every build.
+patches = ["Resources/MuPatches/Auth-Service.patch", "Resources/MuPatches/Boot-Manager.patch",
+           "Resources/MuPatches/Timer.patch", "Resources/MuPatches/Usb-Bus.patch"]
+
+[firmware.defines]
+BUILDID_STRING = "12r-unixnu"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+DEVICE_MODEL = "1"
+ENABLE_SECUREBOOT = "0"
 
 [payload]
 volume = "ASTONESP"
@@ -190,8 +206,12 @@ unique_chip_id = "required"
 [bootimg]
 # The Mu-Silicium aston DTB that Ace3-UniXNU packs (out/phone/firmware.dtb, /chosen initrd keys removed). Mu-Silicium aston
 # reserves the same splash range as sheng: "Display Reserved" 0xB8000000 + 0x2B00000 (astonPkg MemoryMapLib.c).
-dtb = "../Ace3-UniXNU/out/phone/firmware.dtb"
-dtb_node = [{ path = "/reserved-memory/splash_region", props = [{ name = "label", type = "s", value = "cont_splash_region" }, { name = "reg", type = "x", value = ["0x0", "0xb8000000", "0x0", "0x2b00000"] }] }]
+# OnePlus 12R: Ace3-UniXNU is not public. The same DTB is made from Mu-Silicium 6b3d90b7 Resources/DTBs/aston.dtb with
+# /chosen linux,initrd-start and linux,initrd-end deleted (fdtput -d): ~/12r-unixnu/12r/firmware/aston-firmware.dtb.
+# That DTB already has /reserved-memory/splash_region with label cont_splash_region and reg <0 0xb8000000 0 0x2b00000>,
+# exactly the node the dtb_node entry below adds, so the entry is left out (adding it again fails with FDT_ERR_EXISTS).
+dtb = "../12r/firmware/aston-firmware.dtb"
+# dtb_node = [{ path = "/reserved-memory/splash_region", props = [{ name = "label", type = "s", value = "cont_splash_region" }, { name = "reg", type = "x", value = ["0x0", "0xb8000000", "0x0", "0x2b00000"] }] }]
 
 [device_tree]
 source = "device:dts/aston.dts"
