@@ -4,7 +4,9 @@ name: capture-turnip-draw
 # makes for this GPU. The simulation is AArch64-only (kits/ArmSmmu4K, drivers/Adreno740), hence an Apple Silicon runner.
 # Output: the FD_RD_DUMP files (command streams and buffer contents; no keys, seeds or firmware). Nothing runs on hardware.
 on:
-  workflow_dispatch:
+  # Runs on a push to this branch only (a workflow_dispatch needs the file on the default branch).
+  push:
+    branches: [capture-turnip-draw]
 permissions:
   contents: read
 jobs:
