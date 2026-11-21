@@ -1,0 +1,56 @@
+diff --git a/NativeA740FillTest.h b/NativeA740FillTest.h
+index 2aa2301..4370b1d 100644
+--- a/NativeA740FillTest.h
++++ b/NativeA740FillTest.h
+@@ -9,6 +9,8 @@
+ // c1 means the CP reached the end-of-dispatch timestamp. Nothing here runs without the boot argument.
+ #pragma once
+ #include <sys/sysctl.h>
++#include <fcntl.h>
++#include <errno.h>
+ #include "A740FillProgram.h"
+ 
+ namespace {
+@@ -125,4 +127,26 @@ static void a740FillTest(unsigned port) {
+     }
+     gpu.closeFn(gpu.conn);
+ }
++
++// Publish mode (every Metal client but the render server, once per process): 30 s after the device is handed out, on a thread of its
++// own, look the accelerator up again (discovery releases its port) and run the test, once per boot (an exclusive file in
++// /private/var/tmp; where the sandbox refuses it, this process runs it anyway). Only with native-a740-fill=1.
++__attribute__((unused)) static void a740FillStartOnce() {
++    static bool started;
++    if (started || !a740FillWanted()) return;
++    started = true;
++    pthread_t thread;
++    if (pthread_create(&thread, nullptr, [](void *) -> void * {
++            sleep(30);
++            void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
++            auto matching = iokit ? (void *(*)(const char *))dlsym(iokit, "IOServiceMatching") : nullptr;
++            auto getService = iokit ? (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService") : nullptr;
++            const unsigned port = matching && getService ? getService(0, matching("IOAcceleratorES")) : 0;
++            if (!port) return nullptr;
++            const int once = open("/private/var/tmp/a740fill.once", O_CREAT | O_EXCL | O_WRONLY, 0644);
++            if (once >= 0) close(once);
++            if (once >= 0 || errno != EEXIST) a740FillTest(port);
++            return nullptr;
++        }, nullptr) == 0) pthread_detach(thread);
++}
+ }  // namespace
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index e950151..4444b40 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -378,7 +378,10 @@ static id deviceForPort(unsigned port) {
+             return device;
+         }
+ #else
+-        if (!nativeIsRenderServer()) return device = clientDevice(port);
++        if (!nativeIsRenderServer()) {
++            a740FillStartOnce();   // 12R: native A740 compute test, only with native-a740-fill=1 (NativeA740FillTest.h)
++            return device = clientDevice(port);
++        }
+ #endif
+         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
+         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
