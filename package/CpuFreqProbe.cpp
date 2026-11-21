@@ -36,6 +36,13 @@
 // is where a domain whose busiest CPU reached 90 % jumps to, in % of its highest level: below it the domain goes there, at or above it
 // the usual 1.25 x busy x frequency applies (100: the highest level, as before); `sheng-cpufreq-l3=2` (the default) lets the L3 follow
 // the CPUs, at the lowest L3 level at or above the highest of the domains' frequency shares of their maxima (1: mode 3's highest L3 level).
+// Thermal limit (12R, `sheng-thermal=<C>`, default 0 = off): every 16 windows (256 ms) the governor reads the CPU sensors of TSENS v2
+// (tsens0 at 0x0c271000, sensors 1-15: CPUSS and the A715/A710/X3 cores; tsens1 at 0x0c272000, sensors 1-3: the A510 cores; the same
+// blocks and zones as the 12R's Android device tree) and keeps, per domain, the highest level it may use. At or above the target it
+// lowers that limit one level per tick, at or above `sheng-thermal-crit=<C>` (default target + 15) it drops to the lowest level, and
+// once 5 C below the target it raises it one level per second. Android's own trip points for these zones are 90 C passive and 110 C
+// critical. Stuck core (`sheng-cpufreq-stuck-s=<s>`, default 0 = off): a CPU with no idle time for that long is left out of its
+// domain's busiest-CPU share (12R boots 6 and 7: cpu5 stopped idling within 18 s and held the A715/A710 domain at 2803 MHz).
 // Throttle count: in a window where a domain's busiest CPU was at least half busy, its domain state (the frequency the hardware
 // runs, which also drops while the whole cluster idles) under 80 % of the vote counts as a throttled window, with the lowest seen.
 #include <IOKit/IOService.h>
@@ -57,6 +64,9 @@ volatile uint32_t native_cpufreq_boosts;
 volatile uint32_t native_cpufreq_frame[2];
 // Mode 4, per domain: busy windows (busiest CPU >= 50 %), throttled ones among them, lowest domain state (MHz) in a throttled one
 volatile uint32_t native_cpufreq_throttle[9];
+// Thermal limit: [0] last hottest CPU sensor (0.1 C, signed), [1] peak, [2..4] limit per domain (MHz), [5] ticks at or above the
+// target, [6] mask of CPUs left out as stuck, [7] ticks with no valid reading, [8] sensor of the last hottest reading (block*16+n)
+volatile int32_t native_cpufreq_thermal[9];
 // Mode 4, one record per 16 ms window while the diagnostic export holds a ring (BootDiagExport.c kernel.cpufreq.bin): the window's end
 // (mach units), per domain the voted and the running frequency (MHz, the domain state register) and the busiest CPU's busy share (per
 // mille), and flags (1 touch boost, 2 frame floor). native_cpufreq_count counts every record; the ring keeps the last CpuFreqRing.
@@ -180,6 +190,27 @@ struct Levels {
 };
 Levels gLevels[3];
 uint32_t gFloorKHz;
+int32_t gThermTargetDc, gThermCritDc;
+uint32_t gStuckWindows;
+IOMemoryMap *gTsensMap[2];
+uintptr_t gTsens[2];
+constexpr uint64_t kTsensBase[2] = {0x0c271000, 0x0c272000};
+constexpr unsigned kTsensFirst[2] = {1, 1}, kTsensLast[2] = {15, 3};
+constexpr uint32_t kTsensStatus = 0xa0;
+
+// The hottest valid CPU sensor in 0.1 C, or CPUFREQ_NO_TEMP. A word read not valid is read again up to twice (tsens-v2.c does the same).
+int32_t hottestCpu(int32_t *which) {
+    int32_t best = CPUFREQ_NO_TEMP;
+    for (unsigned b = 0; b < 2; ++b) {
+        if (!gTsens[b]) continue;
+        for (unsigned n = kTsensFirst[b]; n <= kTsensLast[b]; ++n) {
+            int32_t t = CPUFREQ_NO_TEMP;
+            for (unsigned tries = 0; tries < 3 && t == CPUFREQ_NO_TEMP; ++tries) t = cpufreq_tsens_v2_dc(rd32(gTsens[b], kTsensStatus + 4 * n));
+            if (t != CPUFREQ_NO_TEMP && (best == CPUFREQ_NO_TEMP || t > best)) {best = t; *which = (int32_t)(b * 16 + n);}
+        }
+    }
+    return best;
+}
 unsigned gBoostMs, gFrameMs, gFramePct, gPFloorPct = 0, gHispeedPct = 60, gL3Mode = 2;
 // sheng-cpufreq-l3=2: the L3's LUT levels in ascending frequency, as buildLevels makes them for a domain (the L3 has no turbo rows).
 Levels gL3Levels;
@@ -241,6 +272,9 @@ void governorThread(void *, wait_result_t) {
     uint32_t submits = &native_adreno_method_stats ? native_adreno_method_stats[5][0] : 0, recent = 0;
     uint64_t winNs = 0, khzNs[3] = {}, busyNs[3] = {};
     uint32_t changes[3] = {};
+    uint32_t stuckRun[kCpus] = {}, stuckMask = 0;
+    unsigned thermLimit[3] = {~0u, ~0u, ~0u}, thermCool[3] = {}, thermTick = 0;
+    int32_t thermT = CPUFREQ_NO_TEMP;
     for (;;) {
         IOSleep(16);
         const uint64_t t = mach_absolute_time(), dt = t - lastT;
@@ -263,13 +297,28 @@ void governorThread(void *, wait_result_t) {
         const bool framing = t < frameEnd;
         if (framing) native_cpufreq_frame[1] = native_cpufreq_frame[1] + 1;
         const bool boost = t < boostEnd;
-        uint64_t busy[3] = {};   // per mille of the busiest CPU
+        uint64_t busy[3] = {};   // per mille of the busiest CPU (stuck CPUs left out)
         for (unsigned c = 0; c < kCpus; ++c) {
             const uint64_t idle = sheng_cpu_idle_mach((int)c);
             const uint64_t b = cpufreq_busy_per_mille(idle, lastIdle[c], dt);
             lastIdle[c] = idle;
             const int d = kCpuDomain[c];
+            if (cpufreq_stuck_update((uint32_t)b, &stuckRun[c], gStuckWindows)) {stuckMask |= 1u << c; continue;}
+            stuckMask &= ~(1u << c);
             if (b > busy[d]) busy[d] = b;
+        }
+        native_cpufreq_thermal[6] = (int32_t)stuckMask;
+        const bool thermNow = gThermTargetDc && (++thermTick & 15) == 0;
+        if (thermNow) {
+            int32_t which = -1;
+            thermT = hottestCpu(&which);
+            if (thermT == CPUFREQ_NO_TEMP) native_cpufreq_thermal[7] = native_cpufreq_thermal[7] + 1;
+            else {
+                native_cpufreq_thermal[0] = thermT;
+                native_cpufreq_thermal[8] = which;
+                if (thermT > native_cpufreq_thermal[1]) native_cpufreq_thermal[1] = thermT;
+                if (thermT >= gThermTargetDc) native_cpufreq_thermal[5] = native_cpufreq_thermal[5] + 1;
+            }
         }
         uint64_t ns = 0;
         absolutetime_to_nanoseconds(dt, &ns);
@@ -316,6 +365,16 @@ void governorThread(void *, wait_result_t) {
                 if (boost) want = l.count - 1;
                 else if (quiet[d] < 12)
                     while (want + 1 < l.count && (uint64_t)l.khz[want] * 100 < (uint64_t)l.khz[l.count - 1] * gPFloorPct) ++want;
+            }
+            if (gThermTargetDc) {
+                const unsigned top = l.count - 1;
+                if (thermLimit[d] > top) thermLimit[d] = top;
+                if (thermNow)
+                    thermLimit[d] = cpufreq_thermal_step(thermT, thermLimit[d], top, &thermCool[d], gThermTargetDc, gThermCritDc, 50, 4);
+                native_cpufreq_thermal[2 + d] = (int32_t)(l.khz[thermLimit[d]] / 1000);
+                if (want > thermLimit[d]) want = thermLimit[d];
+                // Over the limit now: go down at once, not after the usual 4 windows.
+                if (cur[d] > thermLimit[d]) {cur[d] = thermLimit[d]; down[d] = 0; setLevel(d, cur[d]); ++changes[d];}
             }
             if (want > cur[d]) {
                 cur[d] = want; down[d] = 0; setLevel(d, want); ++changes[d];
@@ -396,6 +455,15 @@ extern "C" void sheng_cpufreq_probe(void) {
     PE_parse_boot_argn("sheng-cpufreq-pfloor-pct", &gPFloorPct, sizeof(gPFloorPct));
     PE_parse_boot_argn("sheng-cpufreq-hispeed-pct", &gHispeedPct, sizeof(gHispeedPct));
     PE_parse_boot_argn("sheng-cpufreq-l3", &gL3Mode, sizeof(gL3Mode));
+    unsigned thermC = 0, critC = 0, stuckS = 0;
+    PE_parse_boot_argn("sheng-thermal", &thermC, sizeof(thermC));
+    PE_parse_boot_argn("sheng-thermal-crit", &critC, sizeof(critC));
+    PE_parse_boot_argn("sheng-cpufreq-stuck-s", &stuckS, sizeof(stuckS));
+    if (thermC > 110) thermC = 110;
+    if (thermC && (critC <= thermC || critC > 115)) critC = thermC + 15 > 115 ? 115 : thermC + 15;
+    gThermTargetDc = (int32_t)thermC * 10;
+    gThermCritDc = (int32_t)critC * 10;
+    gStuckWindows = stuckS > 600 ? 600 * 1000 / 16 : stuckS * 1000 / 16;
     if (gPFloorPct > 100) gPFloorPct = 100;
     if (gHispeedPct > 100) gHispeedPct = 100;
     if (!mode || gLock) return;
@@ -405,6 +473,13 @@ extern "C" void sheng_cpufreq_probe(void) {
     gCapKHz = capMHz * 1000;
     for (unsigned d = 0; d < 3; ++d) mapWindow(gDomain[d], kDomainBase[d]);
     if (mode >= 3) mapWindow(gL3, kL3Base);
+    if (mode >= 4 && gThermTargetDc)
+        for (unsigned b = 0; b < 2; ++b) {
+            IODeviceMemory *memory = IODeviceMemory::withRange(kTsensBase[b], kWindowSize);
+            gTsensMap[b] = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+            if (memory) memory->release();
+            gTsens[b] = gTsensMap[b] ? static_cast<uintptr_t>(gTsensMap[b]->getVirtualAddress()) : 0;
+        }
     gMode = mode;
     sheng_cpufreq_poll();
     if (mode >= 4) {

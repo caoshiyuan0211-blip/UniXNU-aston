@@ -133,6 +133,8 @@ kernel_args = [
   "smp=1", "armcpu-spi-ipi=1", "armcpu-self-ipi=1", "armcpu-edge=1", "sheng-data-persist=2", "sheng-cpufreq=4",
   # Brief touch boost; continuous display activity must not impose a CPU frequency floor.
   "sheng-cpufreq-boost-ms=80", "sheng-cpufreq-frame-ms=0",
+  # 12R: TSENS thermal limit (target 70 C, everything to the lowest level at 88 C) and stuck-core exclusion after 20 s (CpuFreqProbe.cpp).
+  "sheng-thermal=70", "sheng-thermal-crit=88", "sheng-cpufreq-stuck-s=20",
   # GPU (stage B), as on iPadOS b5bb234: the A740 powered with its GMU and SQE firmware and this phone's ZAP (sheng-gpu-power=9,
   # sheng-gpu-metal=1, sheng-gpu-dcvs=1: GpuPowerProbe), each frame written by the GPU into the firmware framebuffer (sheng-fb-gpu=1
   # for LegacyDisplayProbe, fb-gpu=1 for GopFramebuffer's presenter), 8-bit BGRA in the render server (fb-bgra=1, the Metal plugin)

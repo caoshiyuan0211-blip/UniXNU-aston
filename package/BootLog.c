@@ -270,6 +270,7 @@ extern volatile uint32_t native_cpufreq_gov[9] __attribute__((weak_import));
 extern volatile uint32_t native_cpufreq_boosts __attribute__((weak_import));
 extern volatile uint32_t native_cpufreq_frame[2] __attribute__((weak_import));
 extern volatile uint32_t native_cpufreq_throttle[9] __attribute__((weak_import));
+extern volatile int32_t native_cpufreq_thermal[9] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
 extern int (*native_adreno_dram_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
 extern int (*native_adreno_cached_read32)(uint64_t, uint32_t *) __attribute__((weak_import));
@@ -1103,6 +1104,12 @@ static size_t compose(char *out, size_t cap, uint32_t slot, unsigned now) {
         const volatile uint32_t *th = native_cpufreq_throttle;
         snprintf(row, sizeof row, "[cpu throttle] busy/throttled windows, lowest MHz: d0 %u/%u %u | d1 %u/%u %u | d2 %u/%u %u",
                  th[0], th[1], th[2], th[3], th[4], th[5], th[6], th[7], th[8]);
+        at = put(out, at, cap, row, sizeof row);
+      }
+      if (&native_cpufreq_thermal && (native_cpufreq_thermal[0] || native_cpufreq_thermal[6] || native_cpufreq_thermal[7])) {
+        const volatile int32_t *tm = native_cpufreq_thermal;
+        snprintf(row, sizeof row, "[thermal] hottest=%d.%dC (sensor %d) peak=%d.%dC limit MHz d0 %d d1 %d d2 %d hot ticks=%d stuck=%x no-reading=%d",
+                 tm[0] / 10, (tm[0] < 0 ? -tm[0] : tm[0]) % 10, tm[8], tm[1] / 10, tm[1] % 10, tm[2], tm[3], tm[4], tm[5], tm[6], tm[7]);
         at = put(out, at, cap, row, sizeof row);
       }
     }
