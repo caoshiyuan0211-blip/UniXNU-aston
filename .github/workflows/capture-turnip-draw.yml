@@ -65,6 +65,7 @@ jobs:
         run: |
           mkdir -p UniXNU/build/turnip-darwin-host/host-include/sys
           cp UniXNU-aston/tools/native-metal/host-include/sys/resource_private.h UniXNU/build/turnip-darwin-host/host-include/sys/
+          python3 UniXNU-aston/tools/native-metal/patch-hostsim.py UniXNU
       - name: host simulation (builds plugin_smoke; later checks may fail, the capture below decides)
         working-directory: UniXNU
         continue-on-error: true
