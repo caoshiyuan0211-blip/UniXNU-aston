@@ -1,0 +1,53 @@
+diff --git a/NativeA740FillTest.h b/NativeA740FillTest.h
+index 4370b1d..278cdd0 100644
+--- a/NativeA740FillTest.h
++++ b/NativeA740FillTest.h
+@@ -11,9 +11,22 @@
+ #include <sys/sysctl.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <sys/time.h>
+ #include "A740FillProgram.h"
+ 
+ namespace {
++// Once per boot across processes: an exclusive file named after this boot's start time (Data persists across boots, so a fixed name
++// would stop every later boot). True when this process claimed it, or when the sandbox refuses the file (then it runs anyway).
++static bool a740FillClaim() {
++    struct timeval boot = {};
++    size_t size = sizeof boot;
++    sysctlbyname("kern.boottime", &boot, &size, nullptr, 0);
++    char path[96];
++    snprintf(path, sizeof path, "/private/var/tmp/a740fill.%ld", long(boot.tv_sec));
++    const int once = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
++    if (once >= 0) close(once);
++    return once >= 0 || errno != EEXIST;
++}
+ static bool a740FillWanted() {
+     char args[1024] = {};
+     size_t size = sizeof args - 1;
+@@ -143,9 +156,7 @@ __attribute__((unused)) static void a740FillStartOnce() {
+             auto getService = iokit ? (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService") : nullptr;
+             const unsigned port = matching && getService ? getService(0, matching("IOAcceleratorES")) : 0;
+             if (!port) return nullptr;
+-            const int once = open("/private/var/tmp/a740fill.once", O_CREAT | O_EXCL | O_WRONLY, 0644);
+-            if (once >= 0) close(once);
+-            if (once >= 0 || errno != EEXIST) a740FillTest(port);
++            if (a740FillClaim()) a740FillTest(port);
+             return nullptr;
+         }, nullptr) == 0) pthread_detach(thread);
+ }
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 4444b40..2335437 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -667,9 +667,7 @@ - (id)initWithAcceleratorPort:(unsigned)port {
+             // 12R: the native (no Vulkan) A740 compute test, with native-a740-fill=1, once per boot (an exclusive file; where the
+             // sandbox refuses it, this process runs the test anyway), never in the render server (its report row is rewritten every 10 s).
+             if (verified == 4 && a740FillWanted() && strcmp(j->name, "backboardd") != 0) {
+-                const int once = open("/private/var/tmp/a740fill.once", O_CREAT | O_EXCL | O_WRONLY, 0644);
+-                if (once >= 0) close(once);
+-                if (once >= 0 || errno != EEXIST) a740FillTest(port);
++                if (a740FillClaim()) a740FillTest(port);
+             }
+             delete j;
+             return nullptr;
