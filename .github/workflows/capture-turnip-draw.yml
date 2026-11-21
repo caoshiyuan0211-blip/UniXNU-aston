@@ -1,0 +1,78 @@
+name: capture-turnip-draw
+# 12R native Metal, stage 2: record Turnip's own a7xx command streams for the smoke test (a compute fill, a clear and one
+# triangle into a 64x64 RGBA8 target) on UniXNU's host GPU simulation, so the native draw generator can follow a draw Turnip
+# makes for this GPU. The simulation is AArch64-only (kits/ArmSmmu4K, drivers/Adreno740), hence an Apple Silicon runner.
+# Output: the FD_RD_DUMP files (command streams and buffer contents; no keys, seeds or firmware). Nothing runs on hardware.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: UniXNU-aston
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+      - name: UniXNU submodules (GPU parts)
+        working-directory: UniXNU
+        run: git submodule update --init --recursive -- drivers/Adreno740 drivers/AdrenoMetal kits/ArmSmmu4K kits/AdrenoPM4
+      - name: tools
+        run: |
+          brew install ninja glslang shaderc spirv-tools bison pkgconf
+          echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
+      - name: upstream Mesa patch
+        run: python3 UniXNU-aston/scripts/fix-upstream-mesa-patch.py UniXNU
+      - name: Mesa work tree (pinned commit and UniXNU's patches)
+        working-directory: UniXNU
+        run: |
+          python3 - <<'EOF'
+          import json, subprocess, sys
+          from pathlib import Path
+          ROOT = Path.cwd()
+          sys.path.insert(0, str(ROOT / 'scripts'))
+          def run(*a): print('+', *a, flush=True); subprocess.run([str(x) for x in a], check=True)
+          pins = json.loads((ROOT / 'scripts/data/adreno-compiler-inputs.json').read_text())
+          mesa = ROOT / '.cache/mesa-work'
+          mesa.mkdir(parents=True)
+          run('git', 'init', '-q', mesa)
+          run('git', '-C', mesa, 'fetch', '--depth=1', pins['mesa'].get('mirror', pins['mesa']['repository']), pins['mesa']['commit'])
+          run('git', '-C', mesa, 'checkout', '-q', '--detach', 'FETCH_HEAD')
+          for patch in pins['patches']:
+              run('git', '-C', mesa, 'apply', ROOT / patch)
+          from mesa_patch_identity import validate_recorded_patches
+          validate_recorded_patches(ROOT, mesa, pins)
+          venv = ROOT / '.cache/mesa-venv'
+          run(sys.executable, '-m', 'venv', venv)
+          run(venv / 'bin/python', '-m', 'pip', 'install', '-q', '-r', ROOT / 'scripts/requirements-adreno-compiler.txt')
+          EOF
+      - name: host Turnip
+        working-directory: UniXNU
+        run: python3 scripts/build-turnip-darwin.py --target host
+      - name: host simulation (builds plugin_smoke; later checks may fail, the capture below decides)
+        working-directory: UniXNU
+        continue-on-error: true
+        run: python3 scripts/check-turnip-darwin-host.py
+      - name: capture
+        working-directory: UniXNU
+        run: |
+          out=build/turnip-darwin-host
+          mkdir -p "$RUNNER_TEMP/rd"
+          DYLD_INSERT_LIBRARIES=$PWD/$out/libhostiokit.dylib MESA_LOG= HOSTSIM_PAGE_SIZE=4096 TU_DEBUG=nocb \
+            FD_RD_DUMP=enable,full FD_RD_DUMP_PATH="$RUNNER_TEMP/rd" \
+            "$out/plugin_smoke" "$PWD/build/mesa-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib" | tee "$RUNNER_TEMP/rd/plugin_smoke.log"
+          ls -la "$RUNNER_TEMP/rd"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-draw-rd
+          path: ${{ runner.temp }}/rd
+          retention-days: 3
