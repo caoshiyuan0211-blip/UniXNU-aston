@@ -30,7 +30,7 @@ jobs:
         run: git submodule update --init --recursive -- drivers/Adreno740 drivers/AdrenoMetal kits/ArmSmmu4K kits/AdrenoPM4
       - name: tools
         run: |
-          brew install ninja glslang shaderc spirv-tools bison pkgconf
+          brew install ninja glslang shaderc spirv-tools bison pkgconf vulkan-headers
           echo "/opt/homebrew/opt/bison/bin" >> "$GITHUB_PATH"
       - name: upstream Mesa patch
         run: python3 UniXNU-aston/scripts/fix-upstream-mesa-patch.py UniXNU
@@ -60,6 +60,11 @@ jobs:
       - name: host Turnip
         working-directory: UniXNU
         run: python3 scripts/build-turnip-darwin.py --target host
+      - name: private header stand-in for the host simulation
+        # NativeAdrenoUserClient.cpp includes XNU's private <sys/resource_private.h> for the GPU role values; the public SDK has no copy.
+        run: |
+          mkdir -p UniXNU/build/turnip-darwin-host/host-include/sys
+          cp UniXNU-aston/tools/native-metal/host-include/sys/resource_private.h UniXNU/build/turnip-darwin-host/host-include/sys/
       - name: host simulation (builds plugin_smoke; later checks may fail, the capture below decides)
         working-directory: UniXNU
         continue-on-error: true
