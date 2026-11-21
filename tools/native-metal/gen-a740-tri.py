@@ -143,6 +143,105 @@ def apply(words, values, verify):
     return seen
 
 
+# ---- Stage 2c: our own shader binaries (12r/metal/a740-compile.c) and the registers computed from their layout ----
+def insert(o, at, words, relocs=()):
+    """Insert whole packets at dword `at`, moving the relocations behind it."""
+    n = len(words)
+    o.words[at:at] = words
+    o.relocs = [(d + n if d >= at else d, k, off, h) for d, k, off, h in o.relocs] + [(at + d, k, off, h) for d, k, off, h in relocs]
+
+def find_packets(words, pred):
+    i, out = 0, []
+    while i < len(words):
+        h = words[i]; n = (h & 0x7f) if h >> 28 == 4 else (h & 0x3fff)
+        if pred(words[i:i + 1 + n]): out.append(i)
+        i += 1 + n
+    return out
+
+def reg_value(words, reg):
+    """The last value the stream writes to `reg` (pkt4 or CP_CONTEXT_REG_BUNCH)."""
+    val, i = None, 0
+    while i < len(words):
+        h = words[i]
+        if h >> 28 == 4:
+            n, r = h & 0x7f, (h >> 8) & 0x3ffff
+            if r <= reg < r + n: val = words[i + 1 + reg - r]
+            i += 1 + n
+        else:
+            n = h & 0x3fff
+            if (h >> 16) & 0x7f == OPS['CP_CONTEXT_REG_BUNCH']:
+                for k in range(1, n, 2):
+                    if words[i + k] == reg: val = words[i + k + 1]
+            i += 1 + n
+    return val
+
+def load_state0(dst_off, state_type, state_src, block, units):
+    # CP_LOAD_STATE6_0: DST_OFF[13:0] STATE_TYPE[15:14] STATE_SRC[17:16] STATE_BLOCK[21:18] NUM_UNIT[31:22]
+    return dst_off | state_type << 14 | state_src << 16 | block << 18 | units << 22
+
+ST6_CONSTANTS, ST6_UBO, SS6_DIRECT, SS6_INDIRECT, SB6_VS_SHADER, SB6_FS_SHADER = 1, 2, 0, 2, 8, 12
+
+def stage2c(o, d, color):
+    import json, math
+    vs, fs = json.load(open(d / 'vs.json')), json.load(open(d / 'fs.json'))
+    # What the stream already says, and our layout must agree with (the registers this stage does not compute):
+    assert vs['outputs'] == [[0, reg_value(o.words, 0xa803) & 0xff]], 'VS position output regid (SP_VS_OUT_REG[0])'
+    assert (reg_value(o.words, 0xa803) >> 8) & 0xf == 0xf, 'position written as xyzw'
+    assert [i[1] for i in vs['inputs'] if i[0] == 9] == [reg_value(o.words, R['A6XX_VFD_CONTROL_1']) & 0xff], 'vertex id regid (VFD_CONTROL_1)'
+    assert fs['outputs'] == [[4, reg_value(o.words, 0xa98e) & 0xff]], 'FS colour output regid (SP_FS_OUTPUT_REG[0])'
+    assert fs['total_in'] == 0 and fs['push_consts_dwords'] == 4 and vs['push_consts_dwords'] == 0
+    assert vs['consts_ubo'] == 1 and fs['consts_ubo'] == -1, 'constant-data UBO slots as in the stream'
+    # tu6_emit_xs (Turnip): SP_xS_CTRL_REG0 from the variant; tu6_emit_xs_config: HLSQ_xS_CNTL constlen (>> 2) | enabled
+    def ctrl0(v, fs_stage):
+        w = (v['max_half_reg'] + 1) << 1 | (v['max_reg'] + 1) << 7 | v['branchstack_hw'] << 14
+        if v['mergedregs']: w |= 0x80000000 if fs_stage else 0x00100000
+        if v['early_preamble']: w |= 0x10000000 if fs_stage else 0x00200000
+        if fs_stage:
+            w |= (1 if v['double_threadsize'] else 0) << 20 | (0x00400000 if v['total_in'] else 0) | (0x00800000 if v['need_full_quad'] else 0)
+            w |= 0x01000000 | (0x04000000 if v['need_pixlod'] else 0)   # UNK24: Turnip always sets it
+        return w
+    values = {
+        R['A6XX_SP_VS_CTRL_REG0']: ctrl0(vs, False), R['A6XX_SP_FS_CTRL_REG0']: ctrl0(fs, True),
+        R['A6XX_SP_VS_INSTRLEN']: vs['instrlen'], R['A6XX_SP_FS_INSTRLEN']: fs['instrlen'],
+        R['A7XX_HLSQ_VS_CNTL']: (vs['constlen'] >> 2) | 0x100, R['A7XX_HLSQ_FS_CNTL']: (fs['constlen'] >> 2) | 0x100,
+        R['A7XX_HLSQ_FS_CNTL_0']: 1 if fs['double_threadsize'] else 0,
+    }
+    # Turnip's FS read the colour from HLSQ_SHARED_CONSTS_IMM; ours reads c0 (loaded below). Zero the shared constants, so a right
+    # colour on the phone can only have come through our own const load.
+    for i in range(4): values[0xab40 + i] = 0
+    before = {r: reg_value(o.words, r) for r in values}
+    apply(o.words, values, verify=False)
+    # Program buffer: our VS (code + constant data) at 0, our FS at the next 256-byte boundary (instrlen units are 128 bytes).
+    vsw, fsw = vs['words'], fs['words']
+    fs_offset = (len(vsw) * 4 + 255) // 256 * 256
+    prog = vsw + [0] * (fs_offset // 4 - len(vsw)) + fsw
+    # Code addresses: the FS reloc pointed at Turnip's layout; the VS one already at 0.
+    o.relocs = [(dd, k, fs_offset if (k == 1 and off == PROG_VS_BYTES) else off, h) for dd, k, off, h in o.relocs]
+    # The constant-data UBO descriptor (Turnip loads it from its preamble; we keep it) now points at our constant data ...
+    ubo = find_packets(o.words, lambda p: op(p) == OPS['CP_LOAD_STATE6_GEOM'] and len(p) == 6 and (p[1] >> 14) & 3 == ST6_UBO)
+    assert len(ubo) == 1
+    u = ubo[0]
+    o.words[u + 5] = math.ceil(vs['constant_data_size'] / 16) << 17          # A6XX_UBO_1_SIZE (vec4), the address high bits ORed in
+    o.relocs = [(dd, k, vs['constant_data_offset'] if dd in (u + 4, u + 5) else off, h) for dd, k, off, h in o.relocs]
+    # ... and, as Turnip's non-preamble path (tu6_emit_xs, !load_shader_consts_via_preamble), the used range goes into the const file.
+    loads, lrel = [], []
+    for r in vs['ubo_ranges']:
+        assert r['block'] == vs['consts_ubo'] and not r['bindless']
+        size = min(r['end'] - r['start'], 16 * vs['constlen'] - r['offset'])
+        at = len(loads)
+        loads += [pkt7(OPS['CP_LOAD_STATE6_GEOM'], 3), load_state0(r['offset'] // 16, ST6_CONSTANTS, SS6_INDIRECT, SB6_VS_SHADER, size // 16), 0, 0]
+        lrel += [(at + 2, 1, vs['constant_data_offset'] + r['start'], 0), (at + 3, 1, vs['constant_data_offset'] + r['start'], 1)]
+    insert(o, u + 6, loads, lrel)
+    # The FS push constants (the colour) into its const file, direct, right before the draw.
+    draw = find_packets(o.words, lambda p: op(p) == OPS['CP_DRAW_INDX_OFFSET'])
+    assert len(draw) == 1
+    push = [pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3 + 4), load_state0(fs['push_consts_vec4'], ST6_CONSTANTS, SS6_DIRECT, SB6_FS_SHADER, 1), 0, 0] + [f32(c) for c in color]
+    insert(o, draw[0], push)
+    check_headers(o.words)
+    print('stage 2c: our shaders; computed', ', '.join(f'{next((k for k, v in R.items() if v == r), hex(r))} {before[r]:#x}->{values[r]:#x}' for r in values))
+    return prog, fs_offset
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -150,6 +249,7 @@ def main():
     ap.add_argument('--size', type=int, nargs=2, default=[64, 64])
     ap.add_argument('--clear', type=float, nargs=4, default=[0.0, 0.0, 1.0, 1.0])
     ap.add_argument('--color', type=float, nargs=4, default=[1.0, 0.5, 0.0, 1.0])
+    ap.add_argument('--shaders', help='stage 2c: DIR with vs.json and fs.json from a740-compile (our own binaries)')
     args = ap.parse_args()
     rdfile = glob.glob(str(HERE / 'capture/*submit00002.rd'))[0]
     bufs, streams = rd.load(rdfile)
@@ -294,6 +394,9 @@ def main():
     vs = struct.pack('<%dI' % (PROG_VS_BYTES // 4), *mem(PROG_VS, PROG_VS_BYTES // 4))
     fs = struct.pack('<%dI' % (PROG_FS_BYTES // 4), *mem(PROG_FS, PROG_FS_BYTES // 4))
     prog = list(struct.unpack('<%dI' % ((len(vs) + len(fs)) // 4), vs + fs))
+    fs_offset = PROG_VS_BYTES
+    if args.shaders:
+        prog, fs_offset = stage2c(o, Path(args.shaders), args.color)
 
     def abgr(c): return sum(round(x * 255) << (8 * i) for i, x in enumerate(c))
     with open(args.out, 'w') as f:
@@ -305,7 +408,7 @@ def main():
                 '#define A740_TRI_W %d\n#define A740_TRI_H %d\n#define A740_TRI_PITCH %d   /* bytes */\n'
                 '#define A740_TRI_CLEAR 0x%08xu   /* ABGR8 */\n#define A740_TRI_COLOR 0x%08xu   /* ABGR8; a channel may round one step either way */\n'
                 '#define A740_TRI_AREA %d   /* the triangle (-0.5,-0.5) (0.5,-0.5) (0,0.5) covers W*H/8 pixels */\n\n'
-                % (PROG_VS_BYTES, W, H, (W * 4 + 63) // 64 * 64, abgr(args.clear), abgr(args.color), W * H // 8))
+                % (fs_offset, W, H, (W * 4 + 63) // 64 * 64, abgr(args.clear), abgr(args.color), W * H // 8))
         def arr(name, w):
             f.write('static const uint32_t %s[%d] = {' % (name, len(w)))
             for i, x in enumerate(w): f.write(('\n    ' if i % 8 == 0 else ' ') + '0x%08x,' % x)
