@@ -91,6 +91,9 @@ def main():
     def mem(addr, n): return rd.read(bufs, addr, n)
 
     o = Out()
+    o.shared_consts = []
+    for q in packets(prim):
+        pass
     # Relocation kinds: 1 program, 2 target, 3 border colours, 4 control
     def reloc_pair(lo_index, kind, offset):
         o.relocs.append((lo_index, kind, offset, 0)); o.relocs.append((lo_index + 1, kind, offset, 1))
@@ -117,6 +120,8 @@ def main():
                     q[1 + k] = q[2 + k] = 0
                 if r == R['A6XX_RB_2D_DST_FLAGS_PITCH']:
                     q[1 + k] = 0
+            if 0xab40 <= reg < 0xab40 + 64:
+                o.shared_consts = list(q[1:1 + n])
             o.add(q); return
         if name in ('CP_SET_AMBLE', 'CP_BV_BR_COUNT_OPS', 'CP_REG_TEST'):
             return
@@ -157,6 +162,11 @@ def main():
             return                                    # Turnip's own timestamp; ours comes at the end
         if name in ('CP_INDIRECT_BUFFER_PFE', 'CP_INDIRECT_BUFFER'):
             run(packets(mem(p[1] | p[2] << 32, p[3] & 0xfffff)), depth + 1); return
+        if name == 'CP_DRAW_INDX_OFFSET' and o.shared_consts:
+            # Diagnostic for boot 11 (512 pixels drawn, none orange): the FS preamble copies the shared immediate constants
+            # (stsc c[0], 0, 4) and outputs c0; write the push-constant colour into HLSQ_SHARED_CONSTS_IMM again right before
+            # the draw, in case the flattened group order lost it.
+            o.add([pkt4(0xab40, len(o.shared_consts))] + o.shared_consts)
         o.add(p)
 
     def reloc_pair_bunch(start, k, q, kind, offset):
