@@ -76,7 +76,7 @@ jobs:
           out=build/turnip-darwin-host
           mkdir -p "$RUNNER_TEMP/rd"
           DYLD_INSERT_LIBRARIES=$PWD/$out/libhostiokit.dylib MESA_LOG= HOSTSIM_TRACE=1 HOSTSIM_PAGE_SIZE=4096 TU_DEBUG=nocb \
-            FD_RD_DUMP=enable,full FD_RD_DUMP_PATH="$RUNNER_TEMP/rd" \
+            FD_RD_DUMP=enable FD_RD_DUMP_PATH="$RUNNER_TEMP/rd" \
             "$out/plugin_smoke" "$PWD/build/mesa-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib" 2>&1 | tee "$RUNNER_TEMP/rd/plugin_smoke.log"
           ls -la "$RUNNER_TEMP/rd"
       - uses: actions/upload-artifact@v4
