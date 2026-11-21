@@ -82,7 +82,75 @@ def check_headers(words):
         else: assert h == pkt7((h >> 16) & 0x7f, h & 0x3fff), hex(h)
 
 
+# ---- Stage 2b: the values that depend on the target and the colours, computed here (Turnip's formulas) ----
+def f32(x): return struct.unpack('<I', struct.pack('<f', x))[0]
+
+def guardband(offset, scale):
+    """Mesa common/freedreno_guardband.h fd_calc_guardband (a4xx+), in float32 steps."""
+    import math
+    gb_min, gb_max = -32768.0, 32767.0
+    sc = abs(scale)
+    gb_adj = min(-((gb_min - offset) / sc), (gb_max - offset) / sc)
+    if gb_adj < 1.0 or math.isinf(gb_adj): return 0x1ff
+    m, e = math.frexp(gb_adj)
+    if e <= 0 or e > 8: return 0x1ff
+    return ((e - 1) << 6) | (int(m * (1 << 7)) - (1 << 6))
+
+def params(W, H, clear, color):
+    """Register -> value for a W x H RGBA8 linear target, cleared to `clear` and drawn in `color` (RGBA floats). Viewport and
+    scissors as Turnip's tu6_emit_viewport and sysmem pass; pitches as a linear fdl layout (64-byte pitch alignment)."""
+    br = (W - 1) | (H - 1) << 16
+    pitch = (W * 4 + 63) // 64 * 64
+    gb = min(0x1ff, guardband(W / 2, W / 2)) | min(0x1ff, guardband(H / 2, H / 2)) << 10
+    v = {
+        R['A6XX_GRAS_SC_WINDOW_SCISSOR_BR']: br, R['A6XX_GRAS_2D_RESOLVE_CNTL_2']: br, R['A6XX_GRAS_2D_DST_BR']: br,
+        R['A6XX_GRAS_2D_SRC_BR_X']: (W - 1) << 8, R['A6XX_GRAS_2D_SRC_BR_Y']: (H - 1) << 8,
+        R['A6XX_RB_2D_DST_PITCH']: pitch // 64,
+        0x8823: pitch // 64, 0x8824: pitch * H // 64,                       # RB_MRT[0].PITCH, ARRAY_PITCH (64-byte units)
+        0x8010: f32(W / 2), 0x8011: f32(W / 2), 0x8012: f32(H / 2), 0x8013: f32(H / 2),   # GRAS_CL_VPORT X/Y offset, scale
+        0x80d1: br,                                                          # GRAS_SC_VIEWPORT_SCISSOR_BR(0)
+        0x80b1: br,                                                          # GRAS_SC_SCREEN_SCISSOR_BR(0)
+        R['A6XX_GRAS_CL_GUARDBAND_CLIP_ADJ']: gb,
+    }
+    for i, c in enumerate(clear): v[R['A6XX_RB_2D_SRC_SOLID_C0'] + i] = round(c * 255)   # RGBA8 UNORM solid fill, per channel
+    for i, c in enumerate(color): v[0xab40 + i] = f32(c)                    # HLSQ_SHARED_CONSTS_IMM: the FS colour (push constant)
+    return v
+
+def apply(words, values, verify):
+    """Write `values` into every pkt4 / CP_CONTEXT_REG_BUNCH write of those registers. With verify, require the stream to hold
+    exactly those values already (the self-check against Turnip's recording). Returns {register: occurrences}."""
+    seen = {}
+    i = 0
+    while i < len(words):
+        h = words[i]
+        if h >> 28 == 4:
+            n, reg = h & 0x7f, (h >> 8) & 0x3ffff
+            for k in range(n):
+                r = reg + k
+                if r in values:
+                    if verify: assert words[i + 1 + k] == values[r], f'reg {r:#x}: recorded {words[i + 1 + k]:#x}, computed {values[r]:#x}'
+                    words[i + 1 + k] = values[r]; seen[r] = seen.get(r, 0) + 1
+            i += 1 + n
+        else:
+            n = h & 0x3fff
+            if (h >> 16) & 0x7f == OPS['CP_CONTEXT_REG_BUNCH']:
+                for k in range(1, n, 2):
+                    r = words[i + k]
+                    if r in values:
+                        if verify: assert words[i + k + 1] == values[r], f'reg {r:#x}: recorded {words[i + k + 1]:#x}, computed {values[r]:#x}'
+                        words[i + k + 1] = values[r]; seen[r] = seen.get(r, 0) + 1
+            i += 1 + n
+    return seen
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('out')
+    ap.add_argument('--size', type=int, nargs=2, default=[64, 64])
+    ap.add_argument('--clear', type=float, nargs=4, default=[0.0, 0.0, 1.0, 1.0])
+    ap.add_argument('--color', type=float, nargs=4, default=[1.0, 0.5, 0.0, 1.0])
+    args = ap.parse_args()
     rdfile = glob.glob(str(HERE / 'capture/*submit00002.rd'))[0]
     bufs, streams = rd.load(rdfile)
     prim_addr, prim_n = streams[0]
@@ -215,19 +283,29 @@ def main():
             o.relocs.append((base + d - starts[ts], 4, off, hi))
     check_headers(o.words)
 
+    # Self-check: for Turnip's own case every computed value must equal the recorded one; then the requested target and colours.
+    turnip = params(64, 64, (0.0, 0.0, 1.0, 1.0), (1.0, 0.5, 0.0, 1.0))
+    seen = apply(o.words, turnip, verify=True)
+    missing = set(turnip) - set(seen)
+    assert not missing, 'never written: ' + ', '.join(hex(r) for r in sorted(missing))
+    W, H = args.size
+    apply(o.words, params(W, H, args.clear, args.color), verify=False)
+    print(f'self-check: {len(turnip)} registers ({sum(seen.values())} writes) computed = Turnip\'s recorded values; generating {W}x{H}')
     vs = struct.pack('<%dI' % (PROG_VS_BYTES // 4), *mem(PROG_VS, PROG_VS_BYTES // 4))
     fs = struct.pack('<%dI' % (PROG_FS_BYTES // 4), *mem(PROG_FS, PROG_FS_BYTES // 4))
     prog = list(struct.unpack('<%dI' % ((len(vs) + len(fs)) // 4), vs + fs))
 
-    with open(sys.argv[1], 'w') as f:
-        f.write('// GENERATED by 12r/metal/gen-a740-tri.py from Turnip\'s recorded a7xx submission (12r/metal/capture); do not edit.\n'
-                '// SPDX-License-Identifier: MIT\n#pragma once\n#include <stdint.h>\n\n'
-                '// Relocation kinds: 1 program (VS at 0, FS at 0x%x), 2 colour target (64x64 RGBA8 linear, pitch 256), 3 border colours,\n'
-                '// 4 control (seqno). kind | 0x80: OR the address\'s high 17 bits into the existing word (a UBO descriptor\'s size field).\n'
+    def abgr(c): return sum(round(x * 255) << (8 * i) for i, x in enumerate(c))
+    with open(args.out, 'w') as f:
+        f.write('// GENERATED by 12r/metal/gen-a740-tri.py from Turnip\'s recorded a7xx submission (12r/metal/capture), target and colour\n'
+                '// registers computed (stage 2b); do not edit. SPDX-License-Identifier: MIT\n#pragma once\n#include <stdint.h>\n\n'
+                '// Relocation kinds: 1 program (VS at 0, FS at 0x%x), 2 colour target (RGBA8 linear), 3 border colours, 4 control (seqno).\n'
+                '// kind | 0x80: OR the address\'s high 17 bits into the existing word (a UBO descriptor\'s size field).\n'
                 'struct A740TriReloc {uint16_t dword; uint8_t kind; uint32_t offset; uint8_t high;};\n'
-                '#define A740_TRI_SIZE %d\n#define A740_TRI_CLEAR 0xffff0000u   /* ABGR8: blue */\n'
-                '#define A740_TRI_COLOR 0xff0080ffu   /* ABGR8: (1, 0.5, 0, 1); 0.5 may round to 0x7f or 0x80 */\n\n'
-                % (PROG_VS_BYTES, SIZE))
+                '#define A740_TRI_W %d\n#define A740_TRI_H %d\n#define A740_TRI_PITCH %d   /* bytes */\n'
+                '#define A740_TRI_CLEAR 0x%08xu   /* ABGR8 */\n#define A740_TRI_COLOR 0x%08xu   /* ABGR8; a channel may round one step either way */\n'
+                '#define A740_TRI_AREA %d   /* the triangle (-0.5,-0.5) (0.5,-0.5) (0,0.5) covers W*H/8 pixels */\n\n'
+                % (PROG_VS_BYTES, W, H, (W * 4 + 63) // 64 * 64, abgr(args.clear), abgr(args.color), W * H // 8))
         def arr(name, w):
             f.write('static const uint32_t %s[%d] = {' % (name, len(w)))
             for i, x in enumerate(w): f.write(('\n    ' if i % 8 == 0 else ' ') + '0x%08x,' % x)
@@ -237,7 +315,7 @@ def main():
         for i, (d, k, off, hi) in enumerate(o.relocs): f.write(('\n    ' if i % 4 == 0 else ' ') + '{%d, %d, %d, %d},' % (d, k, off, hi))
         f.write('\n};\n')
         arr('kA740TriProgram', prog)
-    print(f'{sys.argv[1]}: IB {len(o.words)} dwords, {len(packets(o.words))} packets, {len(o.relocs)} relocations; program {len(prog)} dwords')
+    print(f'{args.out}: IB {len(o.words)} dwords, {len(packets(o.words))} packets, {len(o.relocs)} relocations; program {len(prog)} dwords')
 
 
 if __name__ == '__main__':

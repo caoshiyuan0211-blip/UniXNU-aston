@@ -3,7 +3,8 @@
 import re, importlib.util, collections
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('rd','rd-decode.py'); rd=importlib.util.module_from_spec(spec); spec.loader.exec_module(rd)
-t=open('out/A740TriProgram.h').read()
+import sys
+t=open(sys.argv[1] if len(sys.argv)>1 else 'out/A740TriProgram.h').read()
 ib=[int(x,16) for x in re.search(r'kA740TriIb\[\d+\] = \{(.*?)\};',t,re.S).group(1).replace(',',' ').split()]
 rel=[tuple(int(x) for x in m) for m in re.findall(r'\{(\d+), (\d+), (\d+), (\d+)\}',re.search(r'kA740TriRelocs.*?\};',t,re.S).group(0))]
 regs,ops=rd.tables(Path.home()/'12r-unixnu/ext/mesa-host-build/src/freedreno/registers/adreno')
