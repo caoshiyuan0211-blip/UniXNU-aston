@@ -28,15 +28,17 @@ index b9127d4..fbce4fe 100644
  }
 diff --git a/NativeHakiosA740Test.h b/NativeHakiosA740Test.h
 new file mode 100644
-index 0000000..4f37661
+index 0000000..307c39c
 --- /dev/null
 +++ b/NativeHakiosA740Test.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,187 @@
 +// SPDX-License-Identifier: MIT
 +// Native Metal stage 4a on the OnePlus 12R's A740 (boot argument native-a740-fill=1, after the stage 1-3 tests): hakios-metal's own
 +// driver (MIT, vendored as hakios-metal/: its command queue, command buffer and compute encoder, ported to a7xx) runs fill_id through
 +// the NativeAdreno user client (hakios's Transport over the same calls as the tests above). One report row:
-+//   N hk v<words right of 1024> s<step> r<stage 1's stream through the transport: words right> t<GPU microseconds> a<word 0> b<word 1> <hakios's refusal, if any>
++//   N hk v<compute words right of 1024> r<stage 1's stream through the transport: words right> d<draw pixels right of 12288>
++//        x<wrong pixels> m<largest channel error> q<first wrong pixel> <hakios's refusal, if any>
++// Pass: v1024 r1024 d12288 x0 (stage 4b: hakios's draw on the A740 through its a7xx rewrite).
 +// Pass: v1024/1024 (every word holds gid * K + C, which only its own invocation writes).
 +// Included from NativeA740FillTest.h (Gpu, streamText).
 +#include <mach/mach_time.h>
@@ -45,6 +47,10 @@ index 0000000..4f37661
 +#include "hakios-metal/command.hpp"
 +#include "hakios-metal/native_adreno_transport.hpp"
 +#include "hakios-metal/fill_id_a740.hpp"
++#include "hakios-metal/render.hpp"
++#include "hakios-metal/texture.hpp"
++#include "hakios-metal/tri_color_fs_air.hpp"
++#include "hakios-metal/tri_color_vs_air.hpp"
 +
 +namespace {
 +static void a740HakiosTest(unsigned port) {
@@ -80,7 +86,9 @@ index 0000000..4f37661
 +    int step = 0;
 +    unsigned right = 0;
 +    uint32_t first = 0, second = 0;
-+    unsigned raw = 0;   // stage 1's stream through the transport: words right (8888 no buffers, 9999 submit or wait failed)   // what the GPU left in words 0 and 1 (0x55555555: nothing written)
++    unsigned raw = 0;
++    unsigned drawn = 0, wrong = 0, worst = 0;   // stage 4b: pixels of the draw within 3 steps of their colour, the others, the largest error
++    uint32_t firstWrong = 0;   // stage 1's stream through the transport: words right (8888 no buffers, 9999 submit or wait failed)   // what the GPU left in words 0 and 1 (0x55555555: nothing written)
 +    int64_t gpuNs = 0;
 +    std::string why;
 +    hm::setTargetChip(hm::kChipA740);
@@ -146,12 +154,69 @@ index 0000000..4f37661
 +            } else if (cb) {
 +                why = cb->error();
 +            }
++            // Stage 4b: hakios's draw of tri_color (two triangles over the whole 128x96 RGBA8 target, a pixel's colour its barycentric
++            // weights: red + green + blue = 1) through its a7xx rewrite; every pixel against the colour at its centre
++            hm::TextureDesc td;
++            td.format = hm::PixelFormat::kRGBA8Unorm;
++            td.width = 128;
++            td.height = 96;
++            td.usage = hm::kTextureUsageRenderTarget | hm::kTextureUsageRead;
++            std::string twhy;
++            auto target = hm::Texture::make(device, td, &twhy);
++            if (target && target->contents()) {
++                auto row = [&](unsigned y) {return reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(target->contents()) + y * target->bytesPerRow());};
++                for (unsigned y = 0; y < 96; ++y) for (unsigned x = 0; x < 128; ++x) row(y)[x] = 0x55555555u;
++                hm::RenderPass pass;
++                pass.color0 = target.get();
++                hm::Program p{hm::kernels::tri_color_vs_air, hm::kernels::tri_color_fs_air, hm::Linkage{}, "tri_color"};
++                hm::Draw dr;
++                dr.vertexCount = 6;
++                dr.viewport = hm::Viewport{0, 0, 128, 96, 0, 1};
++                auto dcb = queue->commandBuffer();
++                if (dcb && dcb->draw(p, pass, dr, hm::Bindings{}, hm::Bindings{})) {
++                    dcb->commit();
++                    dcb->waitUntilCompleted();
++                    if (dcb->status() != hm::CommandBuffer::kCompleted && why.empty()) why = "draw: " + dcb->error();
++                    __asm__ volatile("dsb sy" ::: "memory");
++                    auto near = [](uint32_t p, const float c[3], unsigned &e) {
++                        e = 0;
++                        for (int k = 0; k < 3; ++k) {
++                            const int want = int(c[k] * 255.0f + 0.5f), got = int((p >> (8 * k)) & 0xff), d = want > got ? want - got : got - want;
++                            if (unsigned(d) > e) e = unsigned(d);
++                        }
++                        const int a = int(p >> 24);
++                        if (a < 252) e = e > unsigned(255 - a) ? e : unsigned(255 - a);
++                        return e <= 3;
++                    };
++                    for (unsigned y = 0; y < 96; ++y)
++                        for (unsigned x = 0; x < 128; ++x) {
++                            // Metal: NDC y up, the viewport's origin top-left; red (-1,-1) green (1,-1) blue (-1,1), and red (1,-1)
++                            // green (1,1) blue (-1,1): either triangle's colour on the diagonal they share
++                            const float nx = (x + 0.5f) / 128 * 2 - 1, ny = 1 - (y + 0.5f) / 96 * 2;
++                            const float a[3] = {1 - (nx + 1) / 2 - (ny + 1) / 2, (nx + 1) / 2, (ny + 1) / 2};
++                            const float b[3] = {(1 - ny) / 2, 1 - (1 - ny) / 2 - (1 - nx) / 2, (1 - nx) / 2};
++                            const uint32_t px = row(y)[x];
++                            unsigned ea = 0, eb = 0;
++                            const bool okA = nx + ny <= 0.05f && near(px, a, ea), okB = nx + ny >= -0.05f && near(px, b, eb);
++                            if (okA || okB) {++drawn; continue;}
++                            const unsigned e = ea < eb || nx + ny > 0.05f ? (nx + ny > 0.05f ? eb : ea) : eb;
++                            if (e > worst) worst = e;
++                            if (!wrong) firstWrong = px;
++                            ++wrong;
++                        }
++                } else if (why.empty()) {
++                    why = dcb ? "draw: " + dcb->error() : "no command buffer";
++                }
++            } else if (why.empty()) {
++                why = "target: " + twhy;
++            }
 +        }
 +    }
 +    char text[64];
-+    snprintf(text, sizeof text, "N hk v%u s%d r%u t%lld a%x b%x %s", right, step, raw, (long long)(gpuNs / 1000), first, second, why.c_str());
++    snprintf(text, sizeof text, "N hk v%u r%u d%u x%u m%u q%x %s", right, raw, drawn, wrong, worst, firstWrong, why.c_str());
++    (void)first; (void)second; (void)step; (void)gpuNs;
 +    streamText(gpu, text);
-+    gpu.mark(right == 1024 ? 0x6eff : 0x6efe);
++    gpu.mark(right == 1024 && drawn == 128 * 96 ? 0x6eff : 0x6efe);
 +}
 +}  // namespace
 diff --git a/hakios-metal/LICENSE b/hakios-metal/LICENSE
@@ -4724,10 +4789,10 @@ index 0000000..0880b46
 +}  // namespace hakios::metal::a6xx
 diff --git a/hakios-metal/include/hakios-metal/a7xx.hpp b/hakios-metal/include/hakios-metal/a7xx.hpp
 new file mode 100644
-index 0000000..e1aac7f
+index 0000000..41a1d21
 --- /dev/null
 +++ b/hakios-metal/include/hakios-metal/a7xx.hpp
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,337 @@
 +// GENERATED by 12r/metal/tools/gen-hakios-a7xx.py from Mesa 25.0.7 (MIT): the a7xx-only registers hakios-metal writes on
 +// the Adreno 740 (chip 0x43050a01, OnePlus 12R), verbatim from the a6xx.xml.h Mesa's build generates, and the A740's
 +// magic registers from freedreno_devices.py. Do not edit.
@@ -4746,6 +4811,15 @@ index 0000000..e1aac7f
 +constexpr uint32_t kEvWriteUser32B = 0;   // adreno_pm4.xml.h EV_WRITE_USER_32B
 +constexpr uint32_t kRbDoneTs = 22;   // adreno_pm4.xml.h RB_DONE_TS
 +constexpr uint32_t kCpEventWrite7 = 70;   // adreno_pm4.xml.h CP_EVENT_WRITE7
++constexpr uint32_t kCcuCleanColor = 33;   // adreno_pm4.xml.h CCU_CLEAN_COLOR
++constexpr uint32_t kCcuCleanDepth = 32;   // adreno_pm4.xml.h CCU_CLEAN_DEPTH
++constexpr uint32_t kCacheInvalidate = 49;   // adreno_pm4.xml.h CACHE_INVALIDATE
++constexpr uint32_t kCacheFlushTs = 4;   // adreno_pm4.xml.h CACHE_FLUSH_TS
++constexpr uint32_t kPcCcuFlushColorTs = 29;   // adreno_pm4.xml.h PC_CCU_FLUSH_COLOR_TS
++constexpr uint32_t kPcCcuFlushDepthTs = 28;   // adreno_pm4.xml.h PC_CCU_FLUSH_DEPTH_TS
++constexpr uint32_t kWriteGe = 5;   // adreno_pm4.xml.h WRITE_GE
++constexpr uint32_t kCpWaitRegMem = 60;   // adreno_pm4.xml.h CP_WAIT_REG_MEM
++constexpr uint32_t kPollMemory = 1;   // adreno_pm4.xml.h POLL_MEMORY
 +constexpr uint32_t kWorkitemrastorderLinear = 0;   // a6xx.xml.h WORKITEMRASTORDER_LINEAR
 +constexpr uint32_t kWorkitemrastorderTiled = 1;   // a6xx.xml.h WORKITEMRASTORDER_TILED
 +struct Magic { uint32_t reg, value; };
@@ -5056,6 +5130,489 @@ index 0000000..e1aac7f
 +#define CP_THREAD_CONTROL_0_SYNC_THREADS			0x80000000
 +
 +}  // namespace hakios::metal::a7xx
+diff --git a/hakios-metal/include/hakios-metal/a7xx_render.hpp b/hakios-metal/include/hakios-metal/a7xx_render.hpp
+new file mode 100644
+index 0000000..607f38d
+--- /dev/null
++++ b/hakios-metal/include/hakios-metal/a7xx_render.hpp
+@@ -0,0 +1,462 @@
++// GENERATED by 12r/metal/tools/gen-hakios-a7xx-render.py from Mesa 25.0.7's a6xx.xml (MIT) and the 12R's stage 3a A740 stream
++// (Turnip's a7xx state, which drew right on the phone). Do not edit.
++#pragma once
++#include <cstdint>
++
++namespace hakios::metal::a7xx {
++
++struct RegMove { uint32_t a6, a7; };
++struct RegValue { uint32_t reg, value; };
++struct FieldMove { uint8_t a6lo, a6hi, a7lo; };
++struct Reencode { uint32_t a6, a7; uint8_t n; FieldMove f[24]; uint32_t lost; };
++
++// A6XX-only registers and the A7XX register of the same name and field layout
++constexpr RegMove kMoves[] = {
++    {0x09980, 0x09107},   // PC_RASTER_CNTL
++    {0x09981, 0x09809},   // PC_POLYGON_MODE
++    {0x09e08, 0x09810},   // PC_TESSFACTOR_ADDR
++    {0x09e09, 0x09811},   // PC_TESSFACTOR_ADDR.hi
++    {0x0acc0, 0x0a9bf},   // SP_2D_DST_FORMAT
++    {0x0b4c0, 0x0b2c0},   // SP_PS_2D_SRC_INFO
++    {0x0b4c1, 0x0b2c1},   // SP_PS_2D_SRC_SIZE
++    {0x0b4c2, 0x0b2c2},   // SP_PS_2D_SRC
++    {0x0b4c3, 0x0b2c3},   // SP_PS_2D_SRC.hi
++    {0x0b4c5, 0x0b2c5},   // SP_PS_2D_SRC_PLANE1
++    {0x0b4c6, 0x0b2c6},   // SP_PS_2D_SRC_PLANE1.hi
++    {0x0b4c7, 0x0b2c7},   // SP_PS_2D_SRC_PLANE_PITCH
++    {0x0b4c8, 0x0b2c8},   // SP_PS_2D_SRC_PLANE2
++    {0x0b4c9, 0x0b2c9},   // SP_PS_2D_SRC_PLANE2.hi
++    {0x0b4ca, 0x0b2ca},   // SP_PS_2D_SRC_FLAGS
++    {0x0b4cb, 0x0b2cb},   // SP_PS_2D_SRC_FLAGS.hi
++    {0x0b4cc, 0x0b2cc},   // SP_PS_2D_SRC_FLAGS_PITCH
++    {0x0b4cd, 0x0b2cd},   // SP_PS_UNKNOWN_B4CD
++    {0x0b4ce, 0x0b2ce},   // SP_PS_UNKNOWN_B4CE
++    {0x0b4cf, 0x0b2cf},   // SP_PS_UNKNOWN_B4CF
++    {0x0b4d0, 0x0b2d0},   // SP_PS_UNKNOWN_B4D0
++    {0x0b4d1, 0x0ab21},   // SP_WINDOW_OFFSET
++    {0x0b800, 0x0a827},   // HLSQ_VS_CNTL
++    {0x0b801, 0x0a83f},   // HLSQ_HS_CNTL
++    {0x0b802, 0x0a867},   // HLSQ_DS_CNTL
++    {0x0b803, 0x0a898},   // HLSQ_GS_CNTL
++    {0x0b980, 0x0a9c6},   // HLSQ_FS_CNTL_0
++    {0x0b982, 0x0a9c7},   // HLSQ_CONTROL_1_REG
++    {0x0b983, 0x0a9c8},   // HLSQ_CONTROL_2_REG
++    {0x0b984, 0x0a9c9},   // HLSQ_CONTROL_3_REG
++    {0x0b985, 0x0a9ca},   // HLSQ_CONTROL_4_REG
++    {0x0b986, 0x0a9cb},   // HLSQ_CONTROL_5_REG
++    {0x0b987, 0x0a9cd},   // HLSQ_CS_CNTL
++    {0x0b990, 0x0a9d4},   // HLSQ_CS_NDRANGE_0
++    {0x0b991, 0x0a9d5},   // HLSQ_CS_NDRANGE_1
++    {0x0b992, 0x0a9d6},   // HLSQ_CS_NDRANGE_2
++    {0x0b993, 0x0a9d7},   // HLSQ_CS_NDRANGE_3
++    {0x0b994, 0x0a9d8},   // HLSQ_CS_NDRANGE_4
++    {0x0b995, 0x0a9d9},   // HLSQ_CS_NDRANGE_5
++    {0x0b996, 0x0a9da},   // HLSQ_CS_NDRANGE_6
++    {0x0b999, 0x0a9dc},   // HLSQ_CS_KERNEL_GROUP_X
++    {0x0b99a, 0x0a9dd},   // HLSQ_CS_KERNEL_GROUP_Y
++    {0x0b99b, 0x0a9de},   // HLSQ_CS_KERNEL_GROUP_Z
++    {0x0bb00, 0x0ab1c},   // HLSQ_DRAW_CMD
++    {0x0bb01, 0x0ab1d},   // HLSQ_DISPATCH_CMD
++    {0x0bb02, 0x0ab1e},   // HLSQ_EVENT_CMD
++    {0x0bb10, 0x0ab03},   // HLSQ_FS_CNTL
++};
++// A6XX-only registers with no A7XX register of that name: not written on the A740
++constexpr uint32_t kDrops[] = {
++    0x00c58,   // VSC_PRIM_STRM_SIZE[0].REG
++    0x00c59,   // VSC_PRIM_STRM_SIZE[1].REG
++    0x00c5a,   // VSC_PRIM_STRM_SIZE[2].REG
++    0x00c5b,   // VSC_PRIM_STRM_SIZE[3].REG
++    0x00c5c,   // VSC_PRIM_STRM_SIZE[4].REG
++    0x00c5d,   // VSC_PRIM_STRM_SIZE[5].REG
++    0x00c5e,   // VSC_PRIM_STRM_SIZE[6].REG
++    0x00c5f,   // VSC_PRIM_STRM_SIZE[7].REG
++    0x00c60,   // VSC_PRIM_STRM_SIZE[8].REG
++    0x00c61,   // VSC_PRIM_STRM_SIZE[9].REG
++    0x00c62,   // VSC_PRIM_STRM_SIZE[10].REG
++    0x00c63,   // VSC_PRIM_STRM_SIZE[11].REG
++    0x00c64,   // VSC_PRIM_STRM_SIZE[12].REG
++    0x00c65,   // VSC_PRIM_STRM_SIZE[13].REG
++    0x00c66,   // VSC_PRIM_STRM_SIZE[14].REG
++    0x00c67,   // VSC_PRIM_STRM_SIZE[15].REG
++    0x00c68,   // VSC_PRIM_STRM_SIZE[16].REG
++    0x00c69,   // VSC_PRIM_STRM_SIZE[17].REG
++    0x00c6a,   // VSC_PRIM_STRM_SIZE[18].REG
++    0x00c6b,   // VSC_PRIM_STRM_SIZE[19].REG
++    0x00c6c,   // VSC_PRIM_STRM_SIZE[20].REG
++    0x00c6d,   // VSC_PRIM_STRM_SIZE[21].REG
++    0x00c6e,   // VSC_PRIM_STRM_SIZE[22].REG
++    0x00c6f,   // VSC_PRIM_STRM_SIZE[23].REG
++    0x00c70,   // VSC_PRIM_STRM_SIZE[24].REG
++    0x00c71,   // VSC_PRIM_STRM_SIZE[25].REG
++    0x00c72,   // VSC_PRIM_STRM_SIZE[26].REG
++    0x00c73,   // VSC_PRIM_STRM_SIZE[27].REG
++    0x00c74,   // VSC_PRIM_STRM_SIZE[28].REG
++    0x00c75,   // VSC_PRIM_STRM_SIZE[29].REG
++    0x00c76,   // VSC_PRIM_STRM_SIZE[30].REG
++    0x00c77,   // VSC_PRIM_STRM_SIZE[31].REG
++    0x00c78,   // VSC_DRAW_STRM_SIZE[0].REG
++    0x00c79,   // VSC_DRAW_STRM_SIZE[1].REG
++    0x00c7a,   // VSC_DRAW_STRM_SIZE[2].REG
++    0x00c7b,   // VSC_DRAW_STRM_SIZE[3].REG
++    0x00c7c,   // VSC_DRAW_STRM_SIZE[4].REG
++    0x00c7d,   // VSC_DRAW_STRM_SIZE[5].REG
++    0x00c7e,   // VSC_DRAW_STRM_SIZE[6].REG
++    0x00c7f,   // VSC_DRAW_STRM_SIZE[7].REG
++    0x00c80,   // VSC_DRAW_STRM_SIZE[8].REG
++    0x00c81,   // VSC_DRAW_STRM_SIZE[9].REG
++    0x00c82,   // VSC_DRAW_STRM_SIZE[10].REG
++    0x00c83,   // VSC_DRAW_STRM_SIZE[11].REG
++    0x00c84,   // VSC_DRAW_STRM_SIZE[12].REG
++    0x00c85,   // VSC_DRAW_STRM_SIZE[13].REG
++    0x00c86,   // VSC_DRAW_STRM_SIZE[14].REG
++    0x00c87,   // VSC_DRAW_STRM_SIZE[15].REG
++    0x00c88,   // VSC_DRAW_STRM_SIZE[16].REG
++    0x00c89,   // VSC_DRAW_STRM_SIZE[17].REG
++    0x00c8a,   // VSC_DRAW_STRM_SIZE[18].REG
++    0x00c8b,   // VSC_DRAW_STRM_SIZE[19].REG
++    0x00c8c,   // VSC_DRAW_STRM_SIZE[20].REG
++    0x00c8d,   // VSC_DRAW_STRM_SIZE[21].REG
++    0x00c8e,   // VSC_DRAW_STRM_SIZE[22].REG
++    0x00c8f,   // VSC_DRAW_STRM_SIZE[23].REG
++    0x00c90,   // VSC_DRAW_STRM_SIZE[24].REG
++    0x00c91,   // VSC_DRAW_STRM_SIZE[25].REG
++    0x00c92,   // VSC_DRAW_STRM_SIZE[26].REG
++    0x00c93,   // VSC_DRAW_STRM_SIZE[27].REG
++    0x00c94,   // VSC_DRAW_STRM_SIZE[28].REG
++    0x00c95,   // VSC_DRAW_STRM_SIZE[29].REG
++    0x00c96,   // VSC_DRAW_STRM_SIZE[30].REG
++    0x00c97,   // VSC_DRAW_STRM_SIZE[31].REG
++    0x08a00,   // RB_UNKNOWN_8A00
++    0x08a10,   // RB_UNKNOWN_8A10
++    0x08a20,   // RB_UNKNOWN_8A20
++    0x08a30,   // RB_UNKNOWN_8A30
++    0x09100,   // VPC_GS_PARAM
++    0x09210,   // VPC_UNKNOWN_9210
++    0x09211,   // VPC_UNKNOWN_9211
++    0x09b06,   // PC_PRIMITIVE_CNTL_6
++    0x0b605,   // TPL1_UNKNOWN_B605
++    0x0b981,   // HLSQ_UNKNOWN_B981
++    0x0b997,   // HLSQ_CS_CNTL_0
++    0x0b9c0,   // HLSQ_CS_BINDLESS_BASE[0].DESCRIPTOR
++    0x0b9c1,   // HLSQ_CS_BINDLESS_BASE[0].DESCRIPTOR.hi
++    0x0b9c2,   // HLSQ_CS_BINDLESS_BASE[1].DESCRIPTOR
++    0x0b9c3,   // HLSQ_CS_BINDLESS_BASE[1].DESCRIPTOR.hi
++    0x0b9c4,   // HLSQ_CS_BINDLESS_BASE[2].DESCRIPTOR
++    0x0b9c5,   // HLSQ_CS_BINDLESS_BASE[2].DESCRIPTOR.hi
++    0x0b9c6,   // HLSQ_CS_BINDLESS_BASE[3].DESCRIPTOR
++    0x0b9c7,   // HLSQ_CS_BINDLESS_BASE[3].DESCRIPTOR.hi
++    0x0b9c8,   // HLSQ_CS_BINDLESS_BASE[4].DESCRIPTOR
++    0x0b9c9,   // HLSQ_CS_BINDLESS_BASE[4].DESCRIPTOR.hi
++    0x0b9d0,   // HLSQ_CS_CTRL_REG1
++    0x0bb11,   // HLSQ_SHARED_CONSTS
++    0x0bb20,   // HLSQ_BINDLESS_BASE[0].DESCRIPTOR
++    0x0bb21,   // HLSQ_BINDLESS_BASE[0].DESCRIPTOR.hi
++    0x0bb22,   // HLSQ_BINDLESS_BASE[1].DESCRIPTOR
++    0x0bb23,   // HLSQ_BINDLESS_BASE[1].DESCRIPTOR.hi
++    0x0bb24,   // HLSQ_BINDLESS_BASE[2].DESCRIPTOR
++    0x0bb25,   // HLSQ_BINDLESS_BASE[2].DESCRIPTOR.hi
++    0x0bb26,   // HLSQ_BINDLESS_BASE[3].DESCRIPTOR
++    0x0bb27,   // HLSQ_BINDLESS_BASE[3].DESCRIPTOR.hi
++    0x0bb28,   // HLSQ_BINDLESS_BASE[4].DESCRIPTOR
++    0x0bb29,   // HLSQ_BINDLESS_BASE[4].DESCRIPTOR.hi
++    0x0be00,   // HLSQ_UNKNOWN_BE00
++    0x0be01,   // HLSQ_UNKNOWN_BE01
++    0x0be04,   // HLSQ_DBG_ECO_CNTL
++};
++// registers whose fields differ on A7XX: each A6XX field moved to the A7XX field of the same name; LOST: A6XX bits with none
++constexpr Reencode kReencode[] = {
++    {0x00a00, 0x00a00, 0, {}, 0x00000000u},   // CP_APERTURE_CNTL_HOST
++    {0x00a03, 0x00a03, 0, {}, 0x00000000u},   // CP_APERTURE_CNTL_CD
++    {0x08800, 0x08800, 5, {{0, 5, 0}, {8, 14, 8}, {18, 20, 18}, {21, 21, 21}, {24, 26, 24}}, 0x00c00000u},   // RB_BIN_CONTROL
++    {0x08801, 0x08801, 6, {{6, 6, 6}, {7, 7, 7}, {8, 8, 8}, {9, 10, 9}, {11, 11, 11}, {12, 12, 12}}, 0x00ff4738u},   // RB_RENDER_CNTL
++    {0x08822, 0x08822, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[0].BUF_INFO
++    {0x0882a, 0x0882a, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[1].BUF_INFO
++    {0x08832, 0x08832, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[2].BUF_INFO
++    {0x0883a, 0x0883a, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[3].BUF_INFO
++    {0x08842, 0x08842, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[4].BUF_INFO
++    {0x0884a, 0x0884a, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[5].BUF_INFO
++    {0x08852, 0x08852, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[6].BUF_INFO
++    {0x0885a, 0x0885a, 4, {{0, 7, 0}, {8, 9, 8}, {10, 10, 10}, {13, 14, 13}}, 0x00000000u},   // RB_MRT[7].BUF_INFO
++    {0x08872, 0x08872, 2, {{0, 2, 0}, {3, 4, 3}}, 0x00000000u},   // RB_DEPTH_BUFFER_INFO
++    {0x08881, 0x08881, 2, {{0, 0, 0}, {1, 1, 1}}, 0x00000000u},   // RB_STENCIL_INFO
++    {0x08e07, 0x08e07, 1, {{0, 0, 0}}, 0xfffffe84u},   // RB_CCU_CNTL
++    {0x09107, 0x09107, 0, {}, 0x00000005u},   // VPC_UNKNOWN_9107
++    {0x0a99f, 0x0a99f, 5, {{0, 6, 0}, {16, 21, 13}, {22, 25, 19}, {26, 26, 23}, {28, 28, 25}}, 0xe800ff80u},   // SP_FS_PREFETCH[0].CMD
++    {0x0a9a0, 0x0a9a0, 5, {{0, 6, 0}, {16, 21, 13}, {22, 25, 19}, {26, 26, 23}, {28, 28, 25}}, 0xe800ff80u},   // SP_FS_PREFETCH[1].CMD
++    {0x0a9a1, 0x0a9a1, 5, {{0, 6, 0}, {16, 21, 13}, {22, 25, 19}, {26, 26, 23}, {28, 28, 25}}, 0xe800ff80u},   // SP_FS_PREFETCH[2].CMD
++    {0x0a9a2, 0x0a9a2, 5, {{0, 6, 0}, {16, 21, 13}, {22, 25, 19}, {26, 26, 23}, {28, 28, 25}}, 0xe800ff80u},   // SP_FS_PREFETCH[3].CMD
++    {0x0a9c3, 0x0a9c3, 3, {{0, 7, 0}, {9, 9, 8}, {10, 10, 9}}, 0x00000100u},   // SP_CS_CNTL_1
++    {0x0a9f2, 0x0a9f2, 0, {}, 0x00000000u},   // SP_CS_IBO
++    {0x0a9f3, 0x0a9f3, 0, {}, 0x00000000u},   // SP_CS_IBO.hi
++    {0x0b4c4, 0x0b2c4, 0, {}, 0x00ffffffu},   // SP_PS_2D_SRC_PITCH
++    {0x0b998, 0x0a9db, 2, {{0, 7, 0}, {9, 9, 9}}, 0x00000500u},   // HLSQ_CS_CNTL_1
++    {0x0bb08, 0x0ab1f, 8, {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}, {3, 3, 3}, {4, 4, 4}, {5, 5, 5}, {6, 6, 6}, {7, 7, 7}}, 0x000fff00u},   // HLSQ_INVALIDATE_CMD
++};
++// Turnip's a7xx hardware state before a pass that is the same for every pass (tu6_init_hw and the sysmem setup)
++constexpr RegValue kInitConst[] = {
++    {0x0ab1f, 0x01fffeff},   // HLSQ_INVALIDATE_CMD
++    {0x08e07, 0x00000068},   // RB_CCU_CNTL
++    {0x00e17, 0x00040004},   // UCHE_CACHE_WAYS
++    {0x0b600, 0x13100000},   // TPL1_DBG_ECO_CNTL
++    {0x0b602, 0x00000724},   // TPL1_DBG_ECO_CNTL1
++    {0x0ae03, 0x10001402},   // SP_CHICKEN_BITS
++    {0x0ae08, 0x00400400},   // SP_UNKNOWN_AE08
++    {0x0ae09, 0x00430800},   // SP_UNKNOWN_AE09
++    {0x0ae0a, 0x00000000},   // SP_UNKNOWN_AE0A
++    {0x00e10, 0x00000000},   // UCHE_UNKNOWN_0E10
++    {0x00e11, 0x00000000},   // UCHE_UNKNOWN_0E11
++    {0x0ae6c, 0x00000000},   // SP_UNKNOWN_AE6C
++    {0x0ae00, 0x10000000},   // SP_DBG_ECO_CNTL
++    {0x09804, 0x00001f1f},   // PC_MODE_CNTL
++    {0x09e00, 0x00100000},   // PC_DBG_ECO_CNTL
++    {0x09e24, 0x21585600},   // PC_UNKNOWN_9E24
++    {0x0a600, 0x00008000},   // VFD_UNKNOWN_A600
++    {0x0ae06, 0x00000000},   // SP_UNKNOWN_AE06
++    {0x0ae6a, 0x00000000},   // SP_UNKNOWN_AE6A
++    {0x0ae6b, 0x00000080},   // SP_UNKNOWN_AE6B
++    {0x0ae73, 0x00000000},   // SP_UNKNOWN_AE73
++    {0x0ab02, 0x00000000},   // SP_UNKNOWN_AB02
++    {0x0ab01, 0x00000000},   // SP_UNKNOWN_AB01
++    {0x0ab22, 0x00000000},   // SP_UNKNOWN_AB22
++    {0x0b310, 0x00000000},   // SP_UNKNOWN_B310
++    {0x00ce2, 0x00000000},   // SP_UNKNOWN_0CE2
++    {0x00ce3, 0x00000000},   // SP_UNKNOWN_0CE2.hi
++    {0x00ce4, 0x00000000},   // SP_UNKNOWN_0CE4
++    {0x00ce5, 0x00000000},   // SP_UNKNOWN_0CE4.hi
++    {0x00ce6, 0x00000000},   // SP_UNKNOWN_0CE6
++    {0x00ce7, 0x00000000},   // SP_UNKNOWN_0CE6.hi
++    {0x080a7, 0x00000000},   // GRAS_UNKNOWN_80A7
++    {0x08600, 0x00004800},   // GRAS_DBG_ECO_CNTL
++    {0x08e79, 0x00000000},   // RB_UNKNOWN_8E79
++    {0x08899, 0x00000000},   // RB_UNKNOWN_8899
++    {0x08e06, 0x02080000},   // RB_UNKNOWN_8E06
++    {0x09600, 0x02000000},   // VPC_DBG_ECO_CNTL
++    {0x00e12, 0x00000000},   // UCHE_UNKNOWN_0E12
++    {0x08120, 0x09510840},   // GRAS_UNKNOWN_8120
++    {0x08121, 0x00000a62},   // GRAS_UNKNOWN_8121
++    {0x0ae04, 0x00000000},   // SP_FLOAT_CNTL
++    {0x0ae0f, 0x0000003f},   // SP_PERFCTR_ENABLE
++    {0x0ab20, 0x00000000},   // SP_IBO_COUNT
++    {0x0b182, 0x00000000},   // SP_UNKNOWN_B182
++    {0x0a9a8, 0x00000000},   // SP_UNKNOWN_A9A8
++    {0x0ab00, 0x00000005},   // SP_MODE_CONTROL
++    {0x0a009, 0x00000003},   // VFD_ADD_OFFSET
++    {0x08811, 0x00000010},   // RB_UNKNOWN_8811
++    {0x08110, 0x00000002},   // GRAS_UNKNOWN_8110
++    {0x08818, 0x00000000},   // RB_UNKNOWN_8818
++    {0x09236, 0x00000000},   // VPC_POINT_COORD_INVERT
++    {0x09300, 0x00000000},   // VPC_UNKNOWN_9300
++    {0x09306, 0x00000001},   // VPC_SO_DISABLE
++    {0x0b183, 0x00000000},   // SP_UNKNOWN_B183
++    {0x080af, 0x00000000},   // GRAS_UNKNOWN_80AF
++    {0x09602, 0x00000000},   // VPC_UNKNOWN_9602
++    {0x09e72, 0x00000000},   // PC_UNKNOWN_9E72
++    {0x0b309, 0x000000a2},   // SP_TP_MODE_CNTL
++    {0x0a007, 0x00000000},   // VFD_MODE_CNTL
++    {0x08864, 0x00000000},   // RB_ALPHA_CONTROL
++    {0x08e04, 0x00000000},   // RB_DBG_ECO_CNTL
++    {0x08e01, 0x00000000},   // RB_UNKNOWN_8E01
++    {0x08e09, 0x00000007},   // RB_UNKNOWN_8E09
++    {0x0b608, 0x00000000},   // TPL1_BICUBIC_WEIGHTS_TABLE_0
++    {0x0b609, 0x3fe05ff4},   // TPL1_BICUBIC_WEIGHTS_TABLE_1
++    {0x0b60a, 0x3fa0ebee},   // TPL1_BICUBIC_WEIGHTS_TABLE_2
++    {0x0b60b, 0x3f5193ed},   // TPL1_BICUBIC_WEIGHTS_TABLE_3
++    {0x0b60c, 0x3f0243f0},   // TPL1_BICUBIC_WEIGHTS_TABLE_4
++    {0x09885, 0x00020000},   // PC_TESS_PARAM_SIZE
++    {0x09886, 0x00002000},   // PC_TESS_FACTOR_SIZE
++    {0x0930a, 0x00000000},   // 0x930a
++    {0x08c34, 0x00000000},   // RB_UNKNOWN_8C34
++    {0x088e5, 0xc0000000},   // RB_CCU_CNTL2
++    {0x0810b, 0x00000000},   // GRAS_LRZ_CNTL2
++    {0x08113, 0x00000000},   // GRAS_LRZ_DEPTH_BUFFER_INFO
++    {0x08007, 0x00000000},   // GRAS_UNKNOWN_8007
++    {0x0ab21, 0x00000000},   // SP_WINDOW_OFFSET
++    {0x0b2d1, 0x00000000},   // SP_PS_2D_WINDOW_OFFSET
++    {0x08812, 0x000003ff},   // RB_UNKNOWN_8812
++    {0x088e4, 0x00000000},   // RB_BLIT_CLEAR_MODE
++};
++// a7xx-only registers Turnip's draw writes as 0 (no FSR, no aliased components, no dither, VGPR config 0, ...)
++constexpr uint32_t kDrawZeros[] = {
++    0x08001,   // GRAS_VS_CL_CNTL
++    0x08004,   // GRAS_MAX_LAYER_INDEX
++    0x08008,   // GRAS_UNKNOWN_8008
++    0x08014,   // GRAS_CL_VPORT[0].ZOFFSET
++    0x08070,   // GRAS_CL_Z_CLAMP[0].MIN
++    0x08094,   // GRAS_SU_DEPTH_PLANE_CNTL
++    0x08095,   // GRAS_SU_POLY_OFFSET_SCALE
++    0x08096,   // GRAS_SU_POLY_OFFSET_OFFSET
++    0x08097,   // GRAS_SU_POLY_OFFSET_OFFSET_CLAMP
++    0x08098,   // GRAS_SU_DEPTH_BUFFER_INFO
++    0x08099,   // GRAS_SU_CONSERVATIVE_RAS_CNTL
++    0x0809b,   // GRAS_VS_LAYER_CNTL
++    0x080a2,   // GRAS_RAS_MSAA_CNTL
++    0x080a4,   // GRAS_SAMPLE_CONFIG
++    0x080b0,   // GRAS_SC_SCREEN_SCISSOR[0].TL
++    0x080d0,   // GRAS_SC_VIEWPORT_SCISSOR[0].TL
++    0x080f4,   // GRAS_FSR_CONFIG
++    0x080f5,   // GRAS_FSR_BUFFER_DESC
++    0x080f6,   // GRAS_FSR_BUFFER_SIZE
++    0x080f8,   // GRAS_FSR_BUFFER_BASE
++    0x080f9,   // GRAS_FSR_BUFFER_BASE.hi
++    0x080fa,   // GRAS_FSR_BUFFER_PITCH
++    0x08100,   // GRAS_LRZ_CNTL
++    0x08101,   // GRAS_LRZ_PS_INPUT_CNTL
++    0x08109,   // GRAS_SAMPLE_CNTL
++    0x08114,   // GRAS_SU_DEPTH_CNTL
++    0x08115,   // GRAS_SU_STENCIL_CNTL
++    0x08116,   // GRAS_SU_RENDER_CNTL
++    0x08801,   // RB_RENDER_CNTL
++    0x08802,   // RB_RAS_MSAA_CNTL
++    0x08804,   // RB_SAMPLE_CONFIG
++    0x0880a,   // RB_RENDER_CONTROL1
++    0x0880b,   // RB_FS_OUTPUT_CNTL0
++    0x0880e,   // RB_DITHER_CNTL
++    0x0880f,   // RB_SRGB_CNTL
++    0x08810,   // RB_SAMPLE_CNTL
++    0x08821,   // RB_MRT[0].BLEND_CONTROL
++    0x08825,   // RB_MRT[0].BASE
++    0x08826,   // RB_MRT[0].BASE.hi
++    0x08827,   // RB_MRT[0].BASE_GMEM
++    0x0882a,   // RB_MRT[1].BUF_INFO
++    0x0882b,   // RB_MRT[1].PITCH
++    0x0882c,   // RB_MRT[1].ARRAY_PITCH
++    0x0882d,   // RB_MRT[1].BASE
++    0x0882e,   // RB_MRT[1].BASE.hi
++    0x0882f,   // RB_MRT[1].BASE_GMEM
++    0x08832,   // RB_MRT[2].BUF_INFO
++    0x08833,   // RB_MRT[2].PITCH
++    0x08834,   // RB_MRT[2].ARRAY_PITCH
++    0x08835,   // RB_MRT[2].BASE
++    0x08836,   // RB_MRT[2].BASE.hi
++    0x08837,   // RB_MRT[2].BASE_GMEM
++    0x0883a,   // RB_MRT[3].BUF_INFO
++    0x0883b,   // RB_MRT[3].PITCH
++    0x0883c,   // RB_MRT[3].ARRAY_PITCH
++    0x0883d,   // RB_MRT[3].BASE
++    0x0883e,   // RB_MRT[3].BASE.hi
++    0x0883f,   // RB_MRT[3].BASE_GMEM
++    0x08842,   // RB_MRT[4].BUF_INFO
++    0x08843,   // RB_MRT[4].PITCH
++    0x08844,   // RB_MRT[4].ARRAY_PITCH
++    0x08845,   // RB_MRT[4].BASE
++    0x08846,   // RB_MRT[4].BASE.hi
++    0x08847,   // RB_MRT[4].BASE_GMEM
++    0x0884a,   // RB_MRT[5].BUF_INFO
++    0x0884b,   // RB_MRT[5].PITCH
++    0x0884c,   // RB_MRT[5].ARRAY_PITCH
++    0x0884d,   // RB_MRT[5].BASE
++    0x0884e,   // RB_MRT[5].BASE.hi
++    0x0884f,   // RB_MRT[5].BASE_GMEM
++    0x08852,   // RB_MRT[6].BUF_INFO
++    0x08853,   // RB_MRT[6].PITCH
++    0x08854,   // RB_MRT[6].ARRAY_PITCH
++    0x08855,   // RB_MRT[6].BASE
++    0x08856,   // RB_MRT[6].BASE.hi
++    0x08857,   // RB_MRT[6].BASE_GMEM
++    0x0885a,   // RB_MRT[7].BUF_INFO
++    0x0885b,   // RB_MRT[7].PITCH
++    0x0885c,   // RB_MRT[7].ARRAY_PITCH
++    0x0885d,   // RB_MRT[7].BASE
++    0x0885e,   // RB_MRT[7].BASE.hi
++    0x0885f,   // RB_MRT[7].BASE_GMEM
++    0x08860,   // RB_BLEND_RED_F32
++    0x08861,   // RB_BLEND_GREEN_F32
++    0x08862,   // RB_BLEND_BLUE_F32
++    0x08863,   // RB_BLEND_ALPHA_F32
++    0x08870,   // RB_DEPTH_PLANE_CNTL
++    0x08871,   // RB_DEPTH_CNTL
++    0x08872,   // RB_DEPTH_BUFFER_INFO
++    0x08873,   // RB_DEPTH_BUFFER_PITCH
++    0x08874,   // RB_DEPTH_BUFFER_ARRAY_PITCH
++    0x08875,   // RB_DEPTH_BUFFER_BASE
++    0x08876,   // RB_DEPTH_BUFFER_BASE.hi
++    0x08877,   // RB_DEPTH_BUFFER_BASE_GMEM
++    0x08878,   // RB_Z_BOUNDS_MIN
++    0x08879,   // RB_Z_BOUNDS_MAX
++    0x08880,   // RB_STENCIL_CONTROL
++    0x08881,   // RB_STENCIL_INFO
++    0x08887,   // RB_STENCILREF
++    0x08888,   // RB_STENCILMASK
++    0x08889,   // RB_STENCILWRMASK
++    0x08898,   // RB_LRZ_CNTL
++    0x088c0,   // RB_Z_CLAMP_MIN
++    0x088f4,   // RB_FSR_CONFIG
++    0x088f5,   // RB_UNKNOWN_88F5
++    0x08903,   // RB_MRT_FLAG_BUFFER[0].ADDR
++    0x08904,   // RB_MRT_FLAG_BUFFER[0].ADDR.hi
++    0x08905,   // RB_MRT_FLAG_BUFFER[0].PITCH
++    0x09107,   // VPC_UNKNOWN_9107
++    0x09109,   // VPC_PRIMITIVE_CNTL_0
++    0x0910b,   // VPC_MULTIVIEW_MASK
++    0x09200,   // VPC_VARYING_INTERP[0].MODE
++    0x09208,   // VPC_VARYING_PS_REPL[0].MODE
++    0x09216,   // VPC_SO_CNTL
++    0x09305,   // VPC_SO_STREAM_CNTL
++    0x09317,   // PC_RASTER_CNTL_V2
++    0x09802,   // PC_TESS_CNTL
++    0x09806,   // PC_PS_CNTL
++    0x09808,   // PC_SO_STREAM_CNTL
++    0x0980a,   // PC_DGEN_SU_CONSERVATIVE_RAS_CNTL
++    0x09b00,   // PC_PRIMITIVE_CNTL_0
++    0x0a000,   // VFD_CONTROL_0
++    0x0a006,   // VFD_CONTROL_6
++    0x0a00e,   // VFD_INDEX_OFFSET
++    0x0a00f,   // VFD_INSTANCE_START_OFFSET
++    0x0a81b,   // SP_VS_OBJ_FIRST_EXEC_OFFSET
++    0x0a81c,   // SP_VS_OBJ_START
++    0x0a81d,   // SP_VS_OBJ_START.hi
++    0x0a81e,   // SP_VS_PVT_MEM_PARAM
++    0x0a81f,   // SP_VS_PVT_MEM_ADDR
++    0x0a820,   // SP_VS_PVT_MEM_ADDR.hi
++    0x0a821,   // SP_VS_PVT_MEM_SIZE
++    0x0a825,   // SP_VS_PVT_MEM_HW_STACK_OFFSET
++    0x0a82d,   // SP_VS_VGPR_CONFIG
++    0x0a83b,   // SP_HS_CONFIG
++    0x0a83f,   // HLSQ_HS_CNTL
++    0x0a863,   // SP_DS_CONFIG
++    0x0a867,   // HLSQ_DS_CNTL
++    0x0a894,   // SP_GS_CONFIG
++    0x0a898,   // HLSQ_GS_CNTL
++    0x0a982,   // SP_FS_OBJ_FIRST_EXEC_OFFSET
++    0x0a983,   // SP_FS_OBJ_START
++    0x0a984,   // SP_FS_OBJ_START.hi
++    0x0a985,   // SP_FS_PVT_MEM_PARAM
++    0x0a986,   // SP_FS_PVT_MEM_ADDR
++    0x0a987,   // SP_FS_PVT_MEM_ADDR.hi
++    0x0a988,   // SP_FS_PVT_MEM_SIZE
++    0x0a98a,   // SP_SRGB_CNTL
++    0x0a997,   // SP_FS_MRT[1].REG
++    0x0a998,   // SP_FS_MRT[2].REG
++    0x0a999,   // SP_FS_MRT[3].REG
++    0x0a99a,   // SP_FS_MRT[4].REG
++    0x0a99b,   // SP_FS_MRT[5].REG
++    0x0a99c,   // SP_FS_MRT[6].REG
++    0x0a99d,   // SP_FS_MRT[7].REG
++    0x0a9a9,   // SP_FS_PVT_MEM_HW_STACK_OFFSET
++    0x0a9aa,   // HLSQ_FS_UNKNOWN_A9AA
++    0x0a9ac,   // SP_DITHER_CNTL
++    0x0a9ad,   // SP_FSR_CONFIG
++    0x0aa01,   // SP_FS_VGPR_CONFIG
++    0x0aa02,   // SP_PS_ALIASED_COMPONENTS_CONTROL
++    0x0aa03,   // SP_PS_ALIASED_COMPONENTS
++    0x0b300,   // SP_TP_RAS_MSAA_CNTL
++    0x0b304,   // SP_TP_SAMPLE_CONFIG
++};
++// every register Turnip's a7xx stream writes (a hakios device constant outside it is not written on the A740)
++constexpr uint32_t kTurnipRegs[] = {0x00ce2, 0x00ce3, 0x00ce4, 0x00ce5, 0x00ce6, 0x00ce7, 0x00e10, 0x00e11, 0x00e12, 0x00e17, 0x08000, 0x08001, 0x08004, 0x08005, 0x08006, 0x08007, 0x08008, 0x08010, 0x08011, 0x08012, 0x08013, 0x08014, 0x08015, 0x08070, 0x08071, 0x08090, 0x08091, 0x08092, 0x08094, 0x08095, 0x08096, 0x08097, 0x08098, 0x08099, 0x0809b, 0x080a0, 0x080a1, 0x080a2, 0x080a3, 0x080a4, 0x080a7, 0x080af, 0x080b0, 0x080b1, 0x080d0, 0x080d1, 0x080f0, 0x080f1, 0x080f4, 0x080f5, 0x080f6, 0x080f8, 0x080f9, 0x080fa, 0x08100, 0x08101, 0x08102, 0x08103, 0x08104, 0x08105, 0x08106, 0x08107, 0x08109, 0x0810b, 0x08110, 0x08113, 0x08114, 0x08115, 0x08116, 0x08120, 0x08121, 0x08400, 0x08401, 0x08402, 0x08403, 0x08404, 0x08405, 0x08406, 0x0840a, 0x0840b, 0x08600, 0x08800, 0x08801, 0x08802, 0x08803, 0x08804, 0x08809, 0x0880a, 0x0880b, 0x0880c, 0x0880d, 0x0880e, 0x0880f, 0x08810, 0x08811, 0x08812, 0x08818, 0x08820, 0x08821, 0x08822, 0x08823, 0x08824, 0x08825, 0x08826, 0x08827, 0x0882a, 0x0882b, 0x0882c, 0x0882d, 0x0882e, 0x0882f, 0x08832, 0x08833, 0x08834, 0x08835, 0x08836, 0x08837, 0x0883a, 0x0883b, 0x0883c, 0x0883d, 0x0883e, 0x0883f, 0x08842, 0x08843, 0x08844, 0x08845, 0x08846, 0x08847, 0x0884a, 0x0884b, 0x0884c, 0x0884d, 0x0884e, 0x0884f, 0x08852, 0x08853, 0x08854, 0x08855, 0x08856, 0x08857, 0x0885a, 0x0885b, 0x0885c, 0x0885d, 0x0885e, 0x0885f, 0x08860, 0x08861, 0x08862, 0x08863, 0x08864, 0x08865, 0x08870, 0x08871, 0x08872, 0x08873, 0x08874, 0x08875, 0x08876, 0x08877, 0x08878, 0x08879, 0x08880, 0x08881, 0x08887, 0x08888, 0x08889, 0x08890, 0x08898, 0x08899, 0x088c0, 0x088c1, 0x088d3, 0x088d4, 0x088e4, 0x088e5, 0x088f4, 0x088f5, 0x08903, 0x08904, 0x08905, 0x08c00, 0x08c01, 0x08c17, 0x08c18, 0x08c19, 0x08c1a, 0x08c20, 0x08c21, 0x08c22, 0x08c2c, 0x08c2d, 0x08c2e, 0x08c2f, 0x08c34, 0x08e01, 0x08e04, 0x08e06, 0x08e07, 0x08e09, 0x08e79, 0x09101, 0x09104, 0x09107, 0x09108, 0x09109, 0x0910b, 0x0910c, 0x09200, 0x09208, 0x09212, 0x09213, 0x09214, 0x09215, 0x09216, 0x09236, 0x09300, 0x09301, 0x09304, 0x09305, 0x09306, 0x09307, 0x0930a, 0x09311, 0x09314, 0x09317, 0x09600, 0x09602, 0x09802, 0x09804, 0x09806, 0x09808, 0x09809, 0x0980a, 0x09885, 0x09886, 0x09b00, 0x09b01, 0x09b07, 0x09e00, 0x09e24, 0x09e72, 0x0a000, 0x0a001, 0x0a002, 0x0a003, 0x0a004, 0x0a005, 0x0a006, 0x0a007, 0x0a008, 0x0a009, 0x0a00e, 0x0a00f, 0x0a600, 0x0a800, 0x0a802, 0x0a803, 0x0a813, 0x0a81b, 0x0a81c, 0x0a81d, 0x0a81e, 0x0a81f, 0x0a820, 0x0a821, 0x0a823, 0x0a824, 0x0a825, 0x0a827, 0x0a82d, 0x0a83b, 0x0a83f, 0x0a863, 0x0a867, 0x0a894, 0x0a898, 0x0a980, 0x0a982, 0x0a983, 0x0a984, 0x0a985, 0x0a986, 0x0a987, 0x0a988, 0x0a989, 0x0a98a, 0x0a98b, 0x0a98c, 0x0a98d, 0x0a98e, 0x0a996, 0x0a997, 0x0a998, 0x0a999, 0x0a99a, 0x0a99b, 0x0a99c, 0x0a99d, 0x0a99e, 0x0a9a8, 0x0a9a9, 0x0a9aa, 0x0a9ac, 0x0a9ad, 0x0a9ae, 0x0a9bf, 0x0a9c6, 0x0a9c7, 0x0a9c8, 0x0a9c9, 0x0a9ca, 0x0a9cb, 0x0aa01, 0x0aa02, 0x0aa03, 0x0ab00, 0x0ab01, 0x0ab02, 0x0ab03, 0x0ab04, 0x0ab05, 0x0ab1f, 0x0ab20, 0x0ab21, 0x0ab22, 0x0ab40, 0x0ab41, 0x0ab42, 0x0ab43, 0x0ae00, 0x0ae03, 0x0ae04, 0x0ae06, 0x0ae08, 0x0ae09, 0x0ae0a, 0x0ae0f, 0x0ae6a, 0x0ae6b, 0x0ae6c, 0x0ae73, 0x0b180, 0x0b181, 0x0b182, 0x0b183, 0x0b2d1, 0x0b2d2, 0x0b300, 0x0b301, 0x0b302, 0x0b303, 0x0b304, 0x0b307, 0x0b309, 0x0b310, 0x0b600, 0x0b602, 0x0b608, 0x0b609, 0x0b60a, 0x0b60b, 0x0b60c};
++// a7xx registers that copy another (Turnip writes both with one value: tu_pipeline.cc, tu_cmd_buffer.cc)
++constexpr RegMove kMirrors[] = {
++    {0x09809, 0x09307},   // PC_POLYGON_MODE -> VPC_POLYGON_MODE2
++    {0x09107, 0x09317},   // PC_RASTER_CNTL -> PC_RASTER_CNTL_V2
++    {0x09b07, 0x0910c},   // PC_MULTIVIEW_CNTL -> VPC_MULTIVIEW_CNTL
++    {0x09b00, 0x09109},   // PC_PRIMITIVE_CNTL_0 -> VPC_PRIMITIVE_CNTL_0
++};
++constexpr uint32_t kRegGrasClCntl = 0x08000, kGrasClZClampEnable = 1u << 5;   // a7xx: always (tu_pipeline.cc)
++constexpr uint32_t kRegSpFsPrefetchCntl = 0x0a99e;
++constexpr uint32_t kPrefetchConstSlotsNone = (0x1ffu << 6) | (0x1ffu << 16);   // CONSTSLOTID, CONSTSLOTID4COORD 0x1ff (fd6_program.cc, A7XX)
++constexpr uint32_t kRegRbCcuCntl = 0x08e07, kRegRbBinControl = 0x08800, kRegGrasBinControl = 0x080a1;
++constexpr uint32_t kRegHlsqControl5 = 0x0a9cb, kRegHlsqControl2 = 0x0a9c8, kRegHlsqUnknownA9ae = 0x0a9ae;
++constexpr uint32_t kRegA6xxVpcUnknown9107 = 0x09107;   // A6XX VPC_UNKNOWN_9107: A7XX PC_RASTER_CNTL sits there
++constexpr uint32_t kBinControlSysmem = 0x03c00000;   // Turnip's sysmem pass
++
++}  // namespace hakios::metal::a7xx
+diff --git a/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp b/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp
+new file mode 100644
+index 0000000..4fd6b6a
+--- /dev/null
++++ b/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: MIT
++// A finished command buffer rewritten for the Adreno 740 (a7xx): src/a7xx_rewrite.cpp says what changes and why.
++#pragma once
++#include <cstdint>
++#include <vector>
++
++namespace hakios::metal {
++std::vector<uint32_t> a7xxRewrite(const std::vector<uint32_t>& words);
++}  // namespace hakios::metal
 diff --git a/hakios-metal/include/hakios-metal/chip.hpp b/hakios-metal/include/hakios-metal/chip.hpp
 new file mode 100644
 index 0000000..69808ef
@@ -6828,10 +7385,10 @@ index 0000000..3a59aec
 +}  // namespace hakios::metal
 diff --git a/hakios-metal/include/hakios-metal/pm4.hpp b/hakios-metal/include/hakios-metal/pm4.hpp
 new file mode 100644
-index 0000000..5b25776
+index 0000000..60bb8ed
 --- /dev/null
 +++ b/hakios-metal/include/hakios-metal/pm4.hpp
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +// The Adreno command processor's packets (PM4), as the A6xx family reads them (here the Adreno 7c+ Gen 3 of the
 +// SM7325, chip id 0x06030500, an A635-family part to Mesa).
 +//
@@ -6907,6 +7464,8 @@ index 0000000..5b25776
 +    void indirect(uint64_t address, uint32_t words);
 +    // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
 +    void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
++    // one word as it is (a7xx_rewrite.cpp copies the packets it leaves alone)
++    void raw(uint32_t word) { words_.push_back(word); }
 +
 +    const std::vector<uint32_t>& words() const { return words_; }
 +    size_t size() const { return words_.size(); }
@@ -6924,10 +7483,10 @@ index 0000000..5b25776
 +}  // namespace hakios::metal::pm4
 diff --git a/hakios-metal/include/hakios-metal/render.hpp b/hakios-metal/include/hakios-metal/render.hpp
 new file mode 100644
-index 0000000..a7046e6
+index 0000000..b23149f
 --- /dev/null
 +++ b/hakios-metal/include/hakios-metal/render.hpp
-@@ -0,0 +1,610 @@
+@@ -0,0 +1,612 @@
 +// hakios-metal: the render path. ONE draw of a Program (a vertex and a fragment stage) into ONE colour target in
 +// SYSMEM (direct render, no GMEM tiling, no binning) mode, encoded the way compute.cpp encodes a dispatch: one
 +// stream, a table the pass owns, every refusal by name before a word is written.
@@ -6967,6 +7526,7 @@ index 0000000..a7046e6
 +#include <string>
 +#include <vector>
 +
++#include "hakios-metal/chip.hpp"
 +#include "hakios-metal/compute.hpp"
 +#include "hakios-metal/kernel.hpp"
 +#include "hakios-metal/pm4.hpp"
@@ -7393,7 +7953,8 @@ index 0000000..a7046e6
 +    bool tailTimestampBit = false;   // must stay clear (28 October); here for the fake's test only
 +    bool dedupRegs = true;       // in an open pass, a register write that would put the value the register already holds is
 +                                 // left out (CommandBuffer::draw); off: every draw writes all of its state, as before
-+    bool gmem = true;            // a pass that qualifies (gmemPlan) is drawn tile by tile in GMEM: each tile loaded, every draw of the
++    bool gmem = !targetIsA7xx();   // (a7xx: sysmem only, a7xx_rewrite.cpp)
++               // a pass that qualifies (gmemPlan) is drawn tile by tile in GMEM: each tile loaded, every draw of the
 +                                 // pass replayed into it, stored once; off: every pass in sysmem, each draw's blending through memory
 +    bool gmemBinning = false;    // a GMEM pass's draws binned first by the hardware (the VSC), each tile drawing only those that reach
 +                                 // it, rather than every draw in every tile (SpringBoard's 141-161-draw passes: 17-20 ms to 14-17).
@@ -7961,13 +8522,678 @@ index 0000000..995aba6
 +bool makeSampler(const SamplerDesc& desc, Sampler* out, std::string* why);
 +
 +}  // namespace hakios::metal
+diff --git a/hakios-metal/include/hakios-metal/tri_color_fs_air.hpp b/hakios-metal/include/hakios-metal/tri_color_fs_air.hpp
+new file mode 100644
+index 0000000..4dd1039
+--- /dev/null
++++ b/hakios-metal/include/hakios-metal/tri_color_fs_air.hpp
+@@ -0,0 +1,187 @@
++// tri_color_fs_air: hakios::metal::Stage fixture, generated by ir3_compiler -o (tools/mesa/ir3-dump.patch)
++// from out/host/kernels/tri_color_fs.bc for Adreno 7c+ Gen 3 (chip id 0x6030500, gen 6). Do not edit; recompile the shader.
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#include "hakios-metal/render.hpp"
++
++namespace hakios::metal::kernels {
++
++constexpr uint32_t tri_color_fs_air_words[] = {
++    0x00002000, 0x47308b02, 0x00000000, 0x03000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++constexpr Stage tri_color_fs_air = {
++    /* .k = */ {
++        /* .words = */ tri_color_fs_air_words,
++        /* .numWords = */ 32,
++        /* .instrlen = */ 1,
++        /* .constlen = */ 0,
++        /* .maxReg = */ 1,
++        /* .maxHalfReg = */ -1,
++        /* .doubleThreadsize = */ false,
++        /* .mergedRegs = */ true,
++        /* .earlyPreamble = */ false,
++        /* .branchstackHw = */ 0,
++        /* .sharedSize = */ 0,
++        /* .pvtmemSize = */ 0,
++        /* .pvtmemPerWave = */ false,
++        /* .localSize = */ {0, 0, 0},
++        /* .localSizeVariable = */ false,
++        /* .localIdRegid = */ 0xfc,
++        /* .workGroupIdRegid = */ 0xfc,
++        /* .immediates = */ nullptr,
++        /* .numImmediates = */ 0,
++        /* .immediatesOffsetVec4 = */ 0,
++        /* .driverParamsOffsetVec4 = */ -1,
++        /* .numUbos = */ 0,
++        /* .numSsbos = */ 0,
++        /* .numIbos = */ 0,
++        /* .numSamp = */ 0,
++        /* .uboRanges = */ {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}},
++        /* .numUboRanges = */ 0,
++        /* .numBufs = */ 0,
++        /* .bufs = */ {{0, 0xff}, {0, 0xff}, {0, 0xff}, {0, 0xff}},
++        /* .numwgConstRegid = */ 0xff,
++        /* .constantDataOffset = */ 0,
++        /* .constantDataSize = */ 0,
++        /* .name = */ "tri_color_fs_air",
++        /* .source = */ R"ir3(; tri_color_fs, the AIR side of the per-vertex-colour fragment function: the
++; LLVM IR a Metal compiler would emit for
++;
++;     struct Vary { float4 position [[position]]; float4 color; };
++;     fragment float4 tri_color_fs(Vary in [[stage_in]])
++;     {
++;       return in.color;   // [[color(0)]], interpolated
++;     }
++;
++; Hand-written, ours, MIT: nothing in it comes from Apple. Only the SHAPE is
++; Apple's convention: AIR has no stage-in struct, each member the function reads
++; is a parameter of its own carrying an air.fragment_input node with the
++; mangled varying name and the interpolation keys (air.center, air.perspective:
++; centre-sampled, perspective-correct, which is Metal's default), as QuartzCore's
++; upsample_frag_lpf spells them. A member nothing reads (the position here) is
++; left out of the parameter list, as Apple's compiler leaves out what the body
++; does not use when the member is not [[position]].
++;
++; What the front end makes of it: a shader_in variable at VARYING_SLOT_VAR0 with
++; INTERP_MODE_SMOOTH, which ir3 reads with bary.f through the ij_pixel
++; barycentrics (SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL), so the variant carries
++; one bary input at inloc 0 (compmask 0xf) and total_in 4. The name the front end
++; records for this side is air.arg_name ("color"), not the mangled string; a
++; by-name link has to read the latter (air-vs-fs.md, the varying-names gap).
++;
++;   llvm-as tri_color_fs.ll -o tri_color_fs.bc
++;   air2nir tri_color_fs.bc
++;   air2nir --interface tri_color_fs.bc
++;   ir3_compiler --chip-id 0x06030500 tri_color_fs.bc
++
++source_filename = "tri_color_fs"
++target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
++target triple = "air64-apple-ios16.5.0"
++
++define <4 x float> @tri_color_fs(<4 x float> %color) local_unnamed_addr {
++  ret <4 x float> %color
++}
++
++!air.version = !{!0}
++!air.language_version = !{!1}
++!air.fragment = !{!2}
++
++!0 = !{i32 2, i32 5, i32 0}
++!1 = !{!"Metal", i32 3, i32 0, i32 0}
++!2 = !{ptr @tri_color_fs, !3, !5}
++!3 = !{!4}
++!4 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
++!5 = !{!6}
++!6 = !{i32 0, !"air.fragment_input", !"generated(5colorDv4_f)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
++)ir3",
++        /* .textures = */ {},
++        /* .numTextureSlots = */ 0,
++        /* .samplerMask = */ 0,
++        /* .constantDataUbo = */ 0,
++    },
++    /* .kind = */ 1,   // kStageFragment
++    /* .pad0 = */ {0, 0, 0},
++    /* .inputs = */ {
++        /* [0] */ {32, 0xfc, 0xf, 0, 0, 1, 0, 0},   // VARYING_SLOT_VAR0 none cm=f il=0 bary
++        /* [1] */ {56, 0x00, 0x3, 0, 1, 0, 0, 0},   // SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL r0.x cm=3 il=0 sysval
++    },
++    /* .numInputs = */ 2,
++    /* .outputs = */ {
++        /* [0] */ {4, 0x02, 0, 0},   // FRAG_RESULT_DATA0 r0.z, float
++    },
++    /* .numOutputs = */ 1,
++    /* .numAttributes = */ 0,
++    /* .vertexIdRegid = */ 0xfc,
++    /* .instanceIdRegid = */ 0xfc,
++    /* .positionRegid = */ 0xfc,   // none
++    /* .pointSizeRegid = */ 0xfc,
++    /* .clipMask = */ 0x0, /* .cullMask = */ 0x0, /* .writesLayer = */ 0, /* .writesViewport = */ 0,
++    /* .totalIn = */ 4,
++    /* .fragCoordRegid = */ 0xfc,
++    /* .fragcoordCompmask = */ 0x0,
++    /* .pad1 = */ {0, 0, 0},
++    /* .ijRegid = */ {0x00, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc},   // ir3's IJ order: persp pixel, sample, centroid, centre rhw; linear pixel, centroid, sample
++    /* .faceRegid = */ 0xfc,
++    /* .sampleIdRegid = */ 0xfc, /* .sampleMaskInRegid = */ 0xfc,
++    /* .colorRegid = */ {0x02, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc},
++    /* .colorHalf = */ {0, 0, 0, 0, 0, 0, 0, 0},
++    /* .numColorOutputs = */ 1,
++    /* .depthRegid = */ 0xfc, /* .sampleMaskRegid = */ 0xfc, /* .stencilRefRegid = */ 0xfc,
++    /* .writesPos = */ 0, /* .writesSmask = */ 0, /* .writesStencilref = */ 0, /* .dualSrcBlend = */ 0,
++    /* .hasKill = */ 0, /* .perSamp = */ 0, /* .readsPrimid = */ 0, /* .fbRead = */ 0,
++    /* .needPixlod = */ 0, /* .needFullQuad = */ 0,
++    /* .pad2 = */ {0, 0},
++    /* .numSamplerPrefetch = */ 0,
++    /* .prefetch = */ {
++        /* [0] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [1] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [2] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [3] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++    },
++    /* .prefetchEndOfQuad = */ 0,
++    /* .pad3 = */ {0, 0, 0},
++};
++
++// The listing (ir3_shader_disasm):
++// ; num_ubos:           0
++// ; num_driver_params:  0
++// ; offsets:
++// ; ubo_state:
++// ;   num_enabled:      0
++// @in(r0.x)	in0 (wrmask=0x3)
++// (rpt3)bary.f (ei)r0.z, (r)0, r0.x
++// end
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// nop
++// ; FRAG: outputs: r0.z (FRAG_RESULT_DATA0)
++// ; FRAG: inputs: r0.z (VARYING_SLOT_VAR0 slot=32 cm=f,il=0,b=1) r0.x (SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL slot=56 cm=3,il=0,b=0)
++// ; FRAG prog 0/0: 5 instr, 0 nops, 5 non-nops, 0 mov, 0 cov, 32 dwords
++// ; FRAG prog 0/0: 0 last-baryf, 0 last-helper, 0 half, 2 full, 0 constlen
++// ; FRAG prog 0/0: 1 cat0, 0 cat1, 4 cat2, 0 cat3, 0 cat4, 0 cat5, 0 cat6, 0 cat7
++// ; FRAG prog 0/0: 0 sstall, 0 (ss), 0 systall, 0 (sy), 0 loops
++// ; pos (ij_pixel): r0.x
++// ; data0: r0.z
++// 
++
++} // namespace hakios::metal::kernels
+diff --git a/hakios-metal/include/hakios-metal/tri_color_vs_air.hpp b/hakios-metal/include/hakios-metal/tri_color_vs_air.hpp
+new file mode 100644
+index 0000000..8e929cd
+--- /dev/null
++++ b/hakios-metal/include/hakios-metal/tri_color_vs_air.hpp
+@@ -0,0 +1,256 @@
++// tri_color_vs_air: hakios::metal::Stage fixture, generated by ir3_compiler -o (tools/mesa/ir3-dump.patch)
++// from out/host/kernels/tri_color_vs.bc for Adreno 7c+ Gen 3 (chip id 0x6030500, gen 6). Do not edit; recompile the shader.
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#include "hakios-metal/render.hpp"
++
++namespace hakios::metal::kernels {
++
++constexpr uint32_t tri_color_vs_air_words[] = {
++    0x20040000, 0x42b44002, 0x20030000, 0x42b44003,
++    0x20020000, 0x42b44004, 0x20010000, 0x42b44005,
++    0x20000000, 0x42b44006, 0x00002001, 0x4293400b,
++    0x00000002, 0x20884004, 0x00020003, 0x43a00007,
++    0x00042001, 0x4240000a, 0x00030004, 0x43a04006,
++    0x00000003, 0x2088400c, 0x00040005, 0x43a04007,
++    0x00000005, 0x2008c00a, 0x00062001, 0x42400006,
++    0x00052007, 0x66050010, 0x00041006, 0x64830006,
++    0x000b2007, 0x66050007, 0x000b2003, 0x6605400b,
++    0x000c1006, 0x64838007, 0x00060010, 0x43804009,
++    0x00061004, 0x6485000a, 0x00072001, 0x42400007,
++    0x00000000, 0x204cc00f, 0x3f800000, 0x204cc010,
++    0x3f800000, 0x204cc014, 0x10041005, 0x6485800e,
++    0x10040007, 0x64800011, 0x10051004, 0x6484800d,
++    0x1006000a, 0x64800012, 0x00000007, 0x20884013,
++    0x00000000, 0x03000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++constexpr uint32_t tri_color_vs_air_immediates[] = {
++    0x3f800000, 0xbf800000, 0x00000000,
++};
++
++constexpr Stage tri_color_vs_air = {
++    /* .k = */ {
++        /* .words = */ tri_color_vs_air_words,
++        /* .numWords = */ 96,
++        /* .instrlen = */ 2,
++        /* .constlen = */ 8,
++        /* .maxReg = */ 5,
++        /* .maxHalfReg = */ -1,
++        /* .doubleThreadsize = */ false,
++        /* .mergedRegs = */ true,
++        /* .earlyPreamble = */ false,
++        /* .branchstackHw = */ 0,
++        /* .sharedSize = */ 0,
++        /* .pvtmemSize = */ 0,
++        /* .pvtmemPerWave = */ false,
++        /* .localSize = */ {0, 0, 0},
++        /* .localSizeVariable = */ false,
++        /* .localIdRegid = */ 0xfc,
++        /* .workGroupIdRegid = */ 0xfc,
++        /* .immediates = */ tri_color_vs_air_immediates,
++        /* .numImmediates = */ 3,
++        /* .immediatesOffsetVec4 = */ 1,
++        /* .driverParamsOffsetVec4 = */ -1,
++        /* .numUbos = */ 0,
++        /* .numSsbos = */ 0,
++        /* .numIbos = */ 0,
++        /* .numSamp = */ 0,
++        /* .uboRanges = */ {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}},
++        /* .numUboRanges = */ 0,
++        /* .numBufs = */ 0,
++        /* .bufs = */ {{0, 0xff}, {0, 0xff}, {0, 0xff}, {0, 0xff}},
++        /* .numwgConstRegid = */ 0xff,
++        /* .constantDataOffset = */ 0,
++        /* .constantDataSize = */ 0,
++        /* .name = */ "tri_color_vs_air",
++        /* .source = */ R"ir3(; tri_color_vs, the AIR side of the per-vertex-colour vertex function: the LLVM
++; IR a Metal compiler would emit for
++;
++;     struct Vary { float4 position [[position]]; float4 color; };
++;     vertex Vary tri_color_vs(uint vid [[vertex_id]])
++;     {
++;       Vary v;                        // the six positions of tri_flat_vs ...
++;       switch (vid) {
++;         case 0:  v.position = float4(-1, -1, 0, 1); v.color = float4(1, 0, 0, 1); break;   // red
++;         case 1:  v.position = float4( 1, -1, 0, 1); v.color = float4(0, 1, 0, 1); break;   // green
++;         case 2:  v.position = float4(-1,  1, 0, 1); v.color = float4(0, 0, 1, 1); break;   // blue
++;         case 3:  v.position = float4( 1, -1, 0, 1); v.color = float4(1, 0, 0, 1); break;   // red
++;         case 4:  v.position = float4( 1,  1, 0, 1); v.color = float4(0, 1, 0, 1); break;   // green
++;         default: v.position = float4(-1,  1, 0, 1); v.color = float4(0, 0, 1, 1); break;   // blue: vertex 5, and every vid past it
++;       }
++;       return v;                      // ... and a colour varying beside each
++;     }
++;
++; Hand-written, ours, MIT: nothing in it comes from Apple. Only the SHAPE is
++; Apple's convention: the returned struct is spelled packed (<{ }>) and its
++; fields carry one output node each, air.position for the first and
++; air.vertex_output with the mangled varying name for the second, as
++; QuartzCore's std_vert0_lpf spells them. The varying's name
++; "generated(5colorDv4_f)" is what a by-name link would match to the fragment
++; side; the slot is the order of appearance (VARYING_SLOT_VAR0 here,
++; air_to_nir.c translate_output), and with one varying both sides land on VAR0
++; without a link step.
++;
++; No buffer in either stage (the contract's first decision): both the position
++; and the colour are literals chosen by icmp eq + select on the vertex id, the
++; shape of tri_flat_vs. Red at 0 and 3, green at 1 and 4, blue at 2 and 5, so
++; that a pixel's colour is its barycentric weights in the triangle that painted
++; it: (bary_A, bary_B, bary_C, 1) for either triangle.
++;
++;   llvm-as tri_color_vs.ll -o tri_color_vs.bc
++;   air2nir tri_color_vs.bc
++;   air2nir --interface tri_color_vs.bc
++;   ir3_compiler --chip-id 0x06030500 tri_color_vs.bc
++
++source_filename = "tri_color_vs"
++target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
++target triple = "air64-apple-ios16.5.0"
++
++define <{ <4 x float>, <4 x float> }> @tri_color_vs(i32 %vid) local_unnamed_addr {
++  %c4 = icmp eq i32 %vid, 4
++  %c3 = icmp eq i32 %vid, 3
++  %c2 = icmp eq i32 %vid, 2
++  %c1 = icmp eq i32 %vid, 1
++  %c0 = icmp eq i32 %vid, 0
++  ; the position, from vertex 4 down to vertex 0 over vertex 5's default
++  %p4 = select i1 %c4, <4 x float> <float 1.000000e+00, float 1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> <float -1.000000e+00, float 1.000000e+00, float 0.000000e+00, float 1.000000e+00>
++  %p3 = select i1 %c3, <4 x float> <float 1.000000e+00, float -1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %p4
++  %p2 = select i1 %c2, <4 x float> <float -1.000000e+00, float 1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %p3
++  %p1 = select i1 %c1, <4 x float> <float 1.000000e+00, float -1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %p2
++  %p0 = select i1 %c0, <4 x float> <float -1.000000e+00, float -1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %p1
++  ; the colour, the same way: green at 4, red at 3, blue at 2, green at 1, red at 0, blue by default
++  %k4 = select i1 %c4, <4 x float> <float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> <float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 1.000000e+00>
++  %k3 = select i1 %c3, <4 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %k4
++  %k2 = select i1 %c2, <4 x float> <float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 1.000000e+00>, <4 x float> %k3
++  %k1 = select i1 %c1, <4 x float> <float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %k2
++  %k0 = select i1 %c0, <4 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, <4 x float> %k1
++  %r0 = insertvalue <{ <4 x float>, <4 x float> }> undef, <4 x float> %p0, 0
++  %r1 = insertvalue <{ <4 x float>, <4 x float> }> %r0, <4 x float> %k0, 1
++  ret <{ <4 x float>, <4 x float> }> %r1
++}
++
++!air.version = !{!0}
++!air.language_version = !{!1}
++!air.vertex = !{!2}
++
++!0 = !{i32 2, i32 5, i32 0}
++!1 = !{!"Metal", i32 3, i32 0, i32 0}
++!2 = !{ptr @tri_color_vs, !3, !6}
++!3 = !{!4, !5}
++!4 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
++!5 = !{!"air.vertex_output", !"generated(5colorDv4_f)", !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
++!6 = !{!7}
++!7 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
++)ir3",
++        /* .textures = */ {},
++        /* .numTextureSlots = */ 0,
++        /* .samplerMask = */ 0,
++        /* .constantDataUbo = */ 0,
++    },
++    /* .kind = */ 0,   // kStageVertex
++    /* .pad0 = */ {0, 0, 0},
++    /* .inputs = */ {
++        /* [0] */ {9, 0x00, 0x1, 0, 1, 0, 0, 0},   // SYSTEM_VALUE_VERTEX_ID r0.x cm=1 il=0 sysval
++    },
++    /* .numInputs = */ 1,
++    /* .outputs = */ {
++        /* [0] */ {0, 0x0d, 0, 0},   // VARYING_SLOT_POS r3.y, float
++        /* [1] */ {32, 0x11, 0, 0},   // VARYING_SLOT_VAR0 r4.y, float
++    },
++    /* .numOutputs = */ 2,
++    /* .numAttributes = */ 0,
++    /* .vertexIdRegid = */ 0x00,
++    /* .instanceIdRegid = */ 0xfc,
++    /* .positionRegid = */ 0x0d,   // r3.y
++    /* .pointSizeRegid = */ 0xfc,
++    /* .clipMask = */ 0x0, /* .cullMask = */ 0x0, /* .writesLayer = */ 0, /* .writesViewport = */ 0,
++    /* .totalIn = */ 1,
++    /* .fragCoordRegid = */ 0xfc,
++    /* .fragcoordCompmask = */ 0x0,
++    /* .pad1 = */ {0, 0, 0},
++    /* .ijRegid = */ {0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc},   // ir3's IJ order: persp pixel, sample, centroid, centre rhw; linear pixel, centroid, sample
++    /* .faceRegid = */ 0xfc,
++    /* .sampleIdRegid = */ 0xfc, /* .sampleMaskInRegid = */ 0xfc,
++    /* .colorRegid = */ {0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc},
++    /* .colorHalf = */ {0, 0, 0, 0, 0, 0, 0, 0},
++    /* .numColorOutputs = */ 0,
++    /* .depthRegid = */ 0xfc, /* .sampleMaskRegid = */ 0xfc, /* .stencilRefRegid = */ 0xfc,
++    /* .writesPos = */ 1, /* .writesSmask = */ 0, /* .writesStencilref = */ 0, /* .dualSrcBlend = */ 0,
++    /* .hasKill = */ 0, /* .perSamp = */ 0, /* .readsPrimid = */ 0, /* .fbRead = */ 0,
++    /* .needPixlod = */ 0, /* .needFullQuad = */ 0,
++    /* .pad2 = */ {0, 0},
++    /* .numSamplerPrefetch = */ 0,
++    /* .prefetch = */ {
++        /* [0] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [1] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [2] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++        /* [3] */ {0x00, 0, 0, 0x00, 0x0, 0, 0, 0},
++    },
++    /* .prefetchEndOfQuad = */ 0,
++    /* .pad3 = */ {0, 0, 0},
++};
++
++// The listing (ir3_shader_disasm):
++// ; num_ubos:           0
++// ; num_driver_params:  0
++// ; offsets:
++// ;   primitive_param            c0.x (1 vec4)
++// ; ubo_state:
++// ;   num_enabled:      0
++// @in(r0.x)	in0
++// @const(c1.x)	0x3f800000, 0xbf800000, 0x00000000, 0xd0d0d0d0
++// cmps.s.eq hr0.z, r0.x, 4
++// cmps.s.eq hr0.w, r0.x, 3
++// cmps.s.eq hr1.x, r0.x, 2
++// cmps.s.eq hr1.y, r0.x, 1
++// cmps.s.eq hr1.z, r0.x, 0
++// cmps.u.ge hr2.w, 1, r0.x
++// cov.u16f32 (even)r1.x, hr0.z
++// or.b hr1.w, hr0.w, hr0.z
++// sub.u hr2.z, h(1), hr1.x
++// or.b r1.z, hr1.x, hr0.w
++// cov.u16f32 (even)r3.x, hr0.w
++// or.b r1.w, hr1.y, hr1.x
++// cov.u16u32 r2.z, hr1.y
++// sub.u hr1.z, h(1), hr1.z
++// andg hr4.x, hr1.w, hr2.z, hr1.y
++// sel.b32 r1.z, c1.z, r1.z, r1.x
++// andg hr1.w, hr1.w, hr2.z, hr2.w
++// andg r2.w, hr0.w, hr2.z, hr2.w
++// sel.b32 r1.w, c1.z, r1.w, r3.x
++// and.b r2.y, hr4.x, hr1.z
++// sel.b32 r2.z, c1.x, r2.z, r1.z
++// sub.u hr1.w, h(1), hr1.w
++// mov.u32u32 r3.w, 0
++// mov.u32u32 r4.x, 0x3f800000
++// mov.u32u32 r5.x, 0x3f800000
++// sel.b32 r3.z, c1.y, r2.w, c1.x
++// sel.b32 r4.y, r1.w, r0.x, c1.x
++// sel.b32 r3.y, c1.x, r2.y, c1.y
++// sel.b32 r4.z, r2.z, r0.x, c1.z
++// cov.u16f32 (even)r4.w, hr1.w
++// end
++// nop
++// nop
++// nop
++// nop
++// ; VERT: outputs: r3.y (VARYING_SLOT_POS) r4.y (VARYING_SLOT_VAR0)
++// ; VERT: inputs: r0.x (SYSTEM_VALUE_VERTEX_ID slot=9 cm=1,il=0,b=0)
++// ; VERT prog 0/0: 31 instr, 0 nops, 31 non-nops, 3 mov, 4 cov, 70 dwords
++// ; VERT prog 0/0: 0 last-baryf, 0 last-helper, 0 half, 6 full, 8 constlen
++// ; VERT prog 0/0: 1 cat0, 7 cat1, 13 cat2, 10 cat3, 0 cat4, 0 cat5, 0 cat6, 0 cat7
++// ; VERT prog 0/0: 0 sstall, 0 (ss), 0 systall, 0 (sy), 0 loops
++// ; pos: r3.y
++// 
++
++} // namespace hakios::metal::kernels
+diff --git a/hakios-metal/src/a7xx_rewrite.cpp b/hakios-metal/src/a7xx_rewrite.cpp
+new file mode 100644
+index 0000000..8d469fb
+--- /dev/null
++++ b/hakios-metal/src/a7xx_rewrite.cpp
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: MIT
++// hakios-metal's command streams for the Adreno 740 (a7xx, OnePlus 12R): its draw path writes the A635's (a6xx) registers and
++// events; this rewrites a finished command buffer into the a7xx form, with every table generated from Mesa's register XML and from
++// Turnip's own a7xx stream that drew right on the phone (a7xx_render.hpp, a7xx.hpp). What it does, register by register:
++//   - A6XX-only registers move to the A7XX register of the same name and layout (HLSQ_xS_CNTL, HLSQ_CONTROL_n, PC_POLYGON_MODE,
++//     PC_RASTER_CNTL, SP_WINDOW_OFFSET, ...); those with no A7XX register are dropped; those whose fields changed are re-encoded
++//     field by field by name (HLSQ_INVALIDATE_CMD, RB_RENDER_CNTL, RB_MRT[n].BUF_INFO, ...).
++//   - hakios's own a6xx device constants (a6xx.hpp's static tables, RB_CCU_CNTL) take Turnip's a7xx values; the bin control is
++//     Turnip's sysmem value (draws on the A740 are sysmem only); GRAS_CL_CNTL gets Z_CLAMP_ENABLE as Turnip sets it on a7xx;
++//     SP_FS_PREFETCH_CNTL the a7xx "no constant slot" fields; the four registers a7xx mirrors (VPC_POLYGON_MODE2, ...) follow
++//     their source; HLSQ_CONTROL_5's a7xx shading-rate field is none; HLSQ_UNKNOWN_A9AE is computed from HLSQ_CONTROL_2..5 as Turnip's tu6_emit_fs_inputs does.
++//   - events: CP_EVENT_WRITE7's first word (CACHE_INVALIDATE -> CACHE_INVALIDATE7, the CCU flushes -> CCU_CLEAN_*, a value
++//     write with WRITE_ENABLED and a user value); CP_WAIT_MEM_GTE (0x14 on a6xx, CP_WAIT_TIMESTAMP on a7xx) -> CP_WAIT_REG_MEM >=.
++//   - a buffer with a draw starts with Turnip's a7xx device state (tu6_init_hw and the sysmem pass setup) and the a7xx-only
++//     registers its draw writes as 0.
++// The compute path already writes a7xx (compute.cpp): its registers and events pass through unchanged.
++#include "hakios-metal/a7xx_rewrite.hpp"
++
++#include <map>
++#include <set>
++
++#include "hakios-metal/a6xx.hpp"
++#include "hakios-metal/a7xx.hpp"
++#include "hakios-metal/a7xx_render.hpp"
++#include "hakios-metal/pm4.hpp"
++
++namespace hakios::metal {
++
++namespace {
++using namespace a7xx;
++
++constexpr uint32_t kOpWaitMemGte = 0x14;   // a6xx CP_WAIT_MEM_GTE; on a7xx this number is CP_WAIT_TIMESTAMP
++constexpr uint32_t kEventWriteEnabled = CP_EVENT_WRITE7_0_WRITE_ENABLED;
++
++struct Tables {
++    std::map<uint32_t, uint32_t> moves, init, mirrors;
++    std::map<uint32_t, const Reencode*> reencode;
++    std::set<uint32_t> drops, staticRegs, turnip;
++    Tables() {
++        for (const RegMove& m : kMoves) moves[m.a6] = m.a7;
++        for (uint32_t r : kDrops) drops.insert(r);
++        for (const Reencode& e : kReencode) reencode[e.a6] = &e;
++        for (const RegValue& v : kInitConst) init[v.reg] = v.value;
++        for (const RegMove& m : kMirrors) mirrors[m.a6] = m.a7;
++        for (uint32_t r : kTurnipRegs) turnip.insert(r);
++        for (const a6xx::RegWrite& w : a6xx::kStaticState) staticRegs.insert(w.reg);
++        for (const a6xx::RegWrite& w : a6xx::kStaticStateAfterDrawState) staticRegs.insert(w.reg);
++        for (const a6xx::RegWrite& w : a6xx::kStaticStateTail) staticRegs.insert(w.reg);
++    }
++};
++const Tables& tables() {
++    static const Tables t;
++    return t;
++}
++
++uint32_t reencode(const Reencode& e, uint32_t v) {
++    uint32_t out = 0;
++    for (uint8_t i = 0; i < e.n; i++) {
++        const FieldMove& f = e.f[i];
++        const uint32_t width = f.a6hi - f.a6lo + 1;
++        const uint32_t mask = width >= 32 ? ~0u : (1u << width) - 1;
++        out |= ((v >> f.a6lo) & mask) << f.a7lo;
++    }
++    return out;
++}
++
++bool validReg(uint32_t regid) { return (regid & 0xff) < 0xfc; }
++
++// Turnip's tu6_emit_fs_inputs (A7XX): two registers each barycentric pair (one for the centre RHW), one each face, sample id,
++// sample mask and shading rate, two each coordinate pair; with unk8 and unk9 set
++uint32_t hlsqUnknownA9ae(const uint32_t c[4]) {
++    uint32_t n = 0;
++    // CONTROL_2: FACEREGID, SAMPLEID, SAMPLEMASK, CENTERRHW; CONTROL_3: the four pixel/centroid IJ; CONTROL_4: the two sample IJ,
++    // XYCOORDREGID, ZWCOORDREGID; CONTROL_5: LINELENGTHREGID, FOVEATIONQUALITYREGID (the shading rate)
++    for (int s = 0; s < 3; s++) n += validReg(c[0] >> (8 * s));
++    if (validReg(c[0] >> 24)) n += 1;
++    for (int s = 0; s < 4; s++) n += validReg(c[1] >> (8 * s)) ? 2 : 0;
++    for (int s = 0; s < 2; s++) n += validReg(c[2] >> (8 * s)) ? 2 : 0;
++    for (int s = 2; s < 4; s++) n += validReg(c[2] >> (8 * s)) ? 2 : 0;
++    if (validReg(c[3] >> 8)) n += 1;
++    return n | (1u << 8) | (1u << 9);
++}
++
++class Rewriter {
++public:
++    explicit Rewriter(pm4::Stream& out) : out_(out) {}
++
++    void reg(uint32_t r, uint32_t v) {
++        const Tables& t = tables();
++        const uint32_t original = r;
++        if (r == kRegA6xxVpcUnknown9107 || t.drops.count(r)) return;
++        auto m = t.moves.find(r);
++        if (m != t.moves.end()) {
++            r = m->second;
++        } else {
++            auto e = t.reencode.find(r);
++            if (e != t.reencode.end() && r != kRegRbCcuCntl && r != kRegRbBinControl) {
++                v = reencode(*e->second, v);
++                r = e->second->a7;
++            }
++        }
++        if (r == kRegRbBinControl || r == kRegGrasBinControl) v = kBinControlSysmem;
++        // hakios's a6xx device constants that Turnip's a7xx stream never writes: not written on the A740
++        if (t.staticRegs.count(original) && !t.turnip.count(r)) return;
++        // HLSQ_CONTROL_5: a7xx's FOVEATIONQUALITYREGID (bits 15:8, the shading rate; a6xx has no field there) is none, as Turnip
++        // writes it without a shading rate
++        if (r == kRegHlsqControl5 && ((v >> 8) & 0xff) == 0) v |= 0xfcu << 8;
++        if ((t.staticRegs.count(original) || r == kRegRbCcuCntl) && t.init.count(r)) v = t.init.at(r);
++        if (r == kRegGrasClCntl) v |= kGrasClZClampEnable;
++        if (r == kRegSpFsPrefetchCntl) v |= kPrefetchConstSlotsNone;
++        write(r, v);
++        auto mi = t.mirrors.find(r);
++        if (mi != t.mirrors.end()) write(mi->second, v);
++        if (r >= kRegHlsqControl2 && r < kRegHlsqControl2 + 4) {
++            control_[r - kRegHlsqControl2] = v;
++            write(kRegHlsqUnknownA9ae, hlsqUnknownA9ae(control_));
++        }
++    }
++
++    void event(const uint32_t* w, uint32_t n) {
++        const uint32_t e = w[0] & 0xff;
++        if (w[0] & kEventWriteEnabled) {   // already the a7xx form (compute.cpp)
++            out_.packet(kCpEventWrite7, w, n);
++            return;
++        }
++        if (n == 1) {
++            uint32_t e7 = e == kCacheInvalidate ? kCacheInvalidate7 : e == kPcCcuFlushColorTs ? kCcuCleanColor
++                        : e == kPcCcuFlushDepthTs ? kCcuCleanDepth : e == kCacheFlushTs ? kCacheFlush7 : e;
++            simple(e7);
++            return;
++        }
++        if (n == 4) {
++            // a value write when the event is done: the flush itself as a7xx names it, then RB_DONE_TS writing the value
++            if (e == kPcCcuFlushColorTs) simple(kCcuCleanColor);
++            else if (e == kPcCcuFlushDepthTs) simple(kCcuCleanDepth);
++            else if (e == kCacheFlushTs) simple(kCacheFlush7);
++            const uint32_t done = (e == kPcCcuFlushColorTs || e == kPcCcuFlushDepthTs || e == kCacheFlushTs) ? kRbDoneTs : e;
++            const uint32_t x[4] = {CP_EVENT_WRITE7_0_EVENT(done) | kEventWriteEnabled | CP_EVENT_WRITE7_0_WRITE_SRC(kEvWriteUser32B), w[1], w[2], w[3]};
++            out_.packet(kCpEventWrite7, x, 4);
++            return;
++        }
++        out_.packet(kCpEventWrite7, w, n);
++    }
++
++    void waitMemGte(const uint32_t* w) {
++        // CP_WAIT_MEM_GTE: 0, address lo, hi, reference -> CP_WAIT_REG_MEM, memory polled until >= reference
++        const uint32_t x[6] = {a6xx::CP_WAIT_REG_MEM_0_FUNCTION(a6xx::cp_cond_function(kWriteGe)) |
++                                   a6xx::CP_WAIT_REG_MEM_0_POLL(a6xx::poll_memory_type(kPollMemory)),
++                               w[1], w[2], w[3], ~0u, 16};
++        out_.packet(kCpWaitRegMem, x, 6);
++    }
++
++private:
++    void simple(uint32_t e) {
++        const uint32_t x = CP_EVENT_WRITE7_0_EVENT(e);
++        out_.packet(kCpEventWrite7, &x, 1);
++    }
++    void write(uint32_t r, uint32_t v) { out_.registers(r, &v, 1); }
++    pm4::Stream& out_;
++    uint32_t control_[4] = {0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0x0000fcfc};
++};
++
++bool isDraw(uint32_t op) {
++    // the draw packets hakios writes (a6xx.hpp names the ones it uses), and the 2D engine's
++    return op == a6xx::CP_DRAW_INDX_OFFSET || op == a6xx::CP_DRAW_INDIRECT_MULTI || op == a6xx::CP_BLIT;
++}
++}  // namespace
++
++std::vector<uint32_t> a7xxRewrite(const std::vector<uint32_t>& in) {
++    pm4::Stream out;
++    bool draws = false;
++    for (size_t i = 0; i < in.size();) {
++        const pm4::Header h = pm4::decode(in[i]);
++        if (h.kind == pm4::Header::kCommand && isDraw(h.opcode)) draws = true;
++        i += 1 + h.count;
++    }
++    if (draws) {
++        // Turnip's a7xx device state, then the a7xx-only registers its draw writes as 0
++        for (const RegValue& v : kInitConst) out.registers(v.reg, &v.value, 1);
++        for (uint32_t r : kDrawZeros) {
++            const uint32_t zero = 0;
++            out.registers(r, &zero, 1);
++        }
++    }
++    Rewriter rw(out);
++    for (size_t i = 0; i < in.size();) {
++        const pm4::Header h = pm4::decode(in[i]);
++        const uint32_t* w = &in[i + 1];
++        if (h.kind == pm4::Header::kRegisters) {
++            for (uint32_t k = 0; k < h.count; k++) rw.reg(h.reg + k, w[k]);
++        } else if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_EVENT_WRITE && h.count >= 1) {
++            rw.event(w, h.count);
++        } else if (h.kind == pm4::Header::kCommand && h.opcode == kOpWaitMemGte && h.count == 4) {
++            rw.waitMemGte(w);
++        } else {
++            for (uint32_t k = 0; k <= h.count; k++) out.raw(in[i + k]);
++        }
++        i += 1 + h.count;
++    }
++    return out.words();
++}
++
++}  // namespace hakios::metal
 diff --git a/hakios-metal/src/command.cpp b/hakios-metal/src/command.cpp
 new file mode 100644
-index 0000000..56f6965
+index 0000000..fac056a
 --- /dev/null
 +++ b/hakios-metal/src/command.cpp
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,698 @@
 +#include "hakios-metal/a7xx.hpp"
++#include "hakios-metal/a7xx_rewrite.hpp"
 +#include "hakios-metal/chip.hpp"
 +#include "hakios-metal/command.hpp"
 +#include "hakios-metal/texture.hpp"
@@ -8595,8 +9821,10 @@ index 0000000..56f6965
 +    }
 +    std::vector<uint32_t> joined;
 +    if (!prologue.empty()) {
++        // and its words in the a7xx form (a7xx_rewrite.cpp: the draw path writes the A635's registers and events)
++        const std::vector<uint32_t> body = a7xxRewrite(cb->stream_.words());
 +        joined = prologue;
-+        joined.insert(joined.end(), cb->stream_.words().begin(), cb->stream_.words().end());
++        joined.insert(joined.end(), body.begin(), body.end());
 +    }
 +    const std::vector<uint32_t>& w = prologue.empty() ? cb->stream_.words() : joined;
 +    int error = 0;
@@ -10243,10 +11471,10 @@ index 0000000..ce3d65d
 +}  // namespace hakios::metal::pm4
 diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
 new file mode 100644
-index 0000000..6b55bc0
+index 0000000..d81535b
 --- /dev/null
 +++ b/hakios-metal/src/render.cpp
-@@ -0,0 +1,3358 @@
+@@ -0,0 +1,3364 @@
 +// The render path (render.hpp): ONE draw of a Program into ONE colour target in SYSMEM mode, as compute.cpp encodes a
 +// dispatch -- the refusals first, by name, then the table, then the stream group by group under render::Options'
 +// switches. The register sequence is turnip's sysmem pass and r3d path with fd6 as the second witness (render.hpp's
@@ -11499,7 +12727,9 @@ index 0000000..6b55bc0
 +bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
 +                const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
 +                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
-+    if (targetIsA7xx()) return refuse(why, "draws, clears and blits are not ported to the Adreno 740 (a7xx) yet");
++    if (targetIsA7xx() && (program.fs.numSamplerPrefetch != 0 || pass.depth != nullptr || pass.stencil != nullptr)) {
++        return refuse(why, "on the Adreno 740 (a7xx): a sampler prefetch, a depth or a stencil attachment is not ported yet");
++    }
 +    const Stage& vs = program.vs;
 +    // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
 +    // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -12386,7 +13616,11 @@ index 0000000..6b55bc0
 +}
 +
 +bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
-+    if (targetIsA7xx()) return refuse(why, "draws, clears and blits are not ported to the Adreno 740 (a7xx) yet");
++    if (targetIsA7xx()) {
++        bool clears = pass.load == LoadAction::kClear || pass.depth != nullptr || pass.stencil != nullptr;
++        for (const ColorAttachment& c : pass.more) clears |= c.texture != nullptr && c.load == LoadAction::kClear;
++        if (clears) return refuse(why, "on the Adreno 740 (a7xx): a clear, a depth or a stencil attachment is not ported yet (load or dontcare)");
++    }
 +    if (!checkTarget(pass, why)) {
 +        return false;
 +    }

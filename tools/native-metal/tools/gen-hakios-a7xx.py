@@ -60,7 +60,7 @@ with open(out, 'w') as f:
             '// magic registers from freedreno_devices.py. Do not edit.\n#pragma once\n#include <cassert>\n#include <cstdint>\n\nnamespace hakios::metal::a7xx {\n\n')
     f.write(f'constexpr uint32_t kChipId = 0x43050a01u;\n')
     f.write(f'constexpr uint32_t kInstrCacheSize = {instr_cache};   // freedreno_devices.py a6xx.instr_cache_size of the A740\n')
-    for e in ('CACHE_FLUSH7', 'CACHE_INVALIDATE7', 'CP_THREAD_CONTROL', 'CP_SET_THREAD_BR', 'EV_WRITE_USER_32B', 'RB_DONE_TS', 'CP_EVENT_WRITE7'):
+    for e in ('CACHE_FLUSH7', 'CACHE_INVALIDATE7', 'CP_THREAD_CONTROL', 'CP_SET_THREAD_BR', 'EV_WRITE_USER_32B', 'RB_DONE_TS', 'CP_EVENT_WRITE7', 'CCU_CLEAN_COLOR', 'CCU_CLEAN_DEPTH', 'CACHE_INVALIDATE', 'CACHE_FLUSH_TS', 'PC_CCU_FLUSH_COLOR_TS', 'PC_CCU_FLUSH_DEPTH_TS', 'WRITE_GE', 'CP_WAIT_REG_MEM', 'POLL_MEMORY'):
         f.write(f'constexpr uint32_t k{e.title().replace("_", "")} = {enum(e)};   // adreno_pm4.xml.h {e}\n')
     a6 = open(f'{regs_dir}/a6xx.xml.h').read()
     for e in ('WORKITEMRASTORDER_LINEAR', 'WORKITEMRASTORDER_TILED'):
