@@ -203,6 +203,14 @@ jobs:
       - name: host checks
         run: |
           python3 UniXNU-aston/scripts/check-aston-gauge-host.py
+      - name: hakios Mesa for iOS
+        # 12R native Metal stage 4c-2: Mesa 25.0.7 with hakios-metal's AIR front end (MIT, tools/native-metal/hakios-mesa) as
+        # arm64e iOS 27 archives; the plugin build (unixnu-patches/0010) compiles hakios-metal's shader compiler against them.
+        run: |
+          brew list bison >/dev/null 2>&1 || brew install bison
+          export PATH="$(brew --prefix bison)/bin:$PATH"
+          export M4="$(command -v gm4 || command -v m4)"
+          bash UniXNU-aston/tools/native-metal/build-hakios-mesa-ios.sh "$GITHUB_WORKSPACE/UniXNU/build/hakios-mesa-ios"
       - name: kernel and payload
         working-directory: UniXNU
         env:

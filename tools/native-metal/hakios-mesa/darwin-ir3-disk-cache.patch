@@ -1,0 +1,21 @@
+--- a/src/freedreno/ir3/ir3_disk_cache.c	2026-11-22 18:19:39
++++ b/src/freedreno/ir3/ir3_disk_cache.c	2026-11-22 18:19:39
+@@ -34,6 +34,10 @@
+       return;
+ 
+    const char *renderer = fd_dev_name(compiler->dev_id);
++#ifdef __APPLE__
++   /* 12R host tool build: macOS has no ELF build-id; the cache is never used by the assembler tools. */
++   char timestamp[41] = "0000000000000000000000000000000000000000";
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+    assert(note && build_id_length(note) == 20); /* sha1 */
+@@ -43,6 +47,7 @@
+ 
+    char timestamp[41];
+    _mesa_sha1_format(timestamp, id_sha1);
++#endif
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
