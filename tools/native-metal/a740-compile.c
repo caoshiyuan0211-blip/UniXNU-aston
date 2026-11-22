@@ -22,6 +22,8 @@
 #include "adreno_common.xml.h"
 #include "adreno_pm4.xml.h"
 #include "a6xx.xml.h"
+#include "fdl/freedreno_layout.h"
+#include "util/format/u_format.h"
 
 static void *read_all(const char *path, size_t *size) {
     FILE *f = fopen(path, "rb");
@@ -93,6 +95,32 @@ static struct compiled compile(struct ir3_compiler *compiler, gl_shader_stage st
         }
         nir_metadata_preserve(impl, nir_metadata_none);
     }
+    // Combined image-samplers as direct (non-bindless) texture and sampler slots: slot = the variable's binding (set 0). The GPU's
+    // SP_FS_TEX_CONST / SP_FS_TEX_SAMP tables, loaded with CP_LOAD_STATE6 (as Mesa's Gallium driver does on a6xx/a7xx).
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex) continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            for (int kind = 0; kind < 2; kind++) {
+                const int i = nir_tex_instr_src_index(tex, kind ? nir_tex_src_sampler_deref : nir_tex_src_texture_deref);
+                if (i < 0) continue;
+                nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[i].src));
+                if (!var || var->data.descriptor_set != 0) { fprintf(stderr, "texture outside set 0\n"); exit(1); }
+                if (kind) tex->sampler_index = var->data.binding; else tex->texture_index = var->data.binding;
+                nir_tex_instr_remove_src(tex, i);
+            }
+        }
+        nir_metadata_preserve(impl, nir_metadata_none);
+    }
+    NIR_PASS_V(nir, nir_opt_dce);
+    nir_foreach_variable_with_modes_safe(var, nir, nir_var_uniform) if (glsl_type_is_sampler(glsl_without_array(var->type))) exec_node_remove(&var->node);
+    nir->info.num_textures = 0;
+    nir_foreach_function_impl(impl, nir) nir_foreach_block(block, impl) nir_foreach_instr(instr, block)
+        if (instr->type == nir_instr_type_tex) nir->info.num_textures = MAX2(nir->info.num_textures, nir_instr_as_tex(instr)->texture_index + 1);
+    // ir3 sizes the sampler table from info.textures_used (only Gallium's state tracker / nir_lower_cl_images fill it in).
+    BITSET_ZERO(nir->info.textures_used); BITSET_ZERO(nir->info.samplers_used);
+    if (nir->info.num_textures) { BITSET_SET_RANGE(nir->info.textures_used, 0, nir->info.num_textures - 1); BITSET_SET_RANGE(nir->info.samplers_used, 0, nir->info.num_textures - 1); }
+
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     struct ir3_shader_nir_options nir_options = {0};
     ir3_finalize_nir(compiler, &nir_options, nir);
@@ -358,6 +386,32 @@ static void emit_fs_outputs(const struct ir3_shader_variant *fs) {
     reg(REG_A6XX_RB_RENDER_COMPONENTS, fs_render_components);
 }
 
+// Gallium's fd6_program.cc sp_xs_config (Turnip's tu6_emit_xs_config is the same for non-bindless shaders).
+static uint32_t sp_xs_config(const struct ir3_shader_variant *v) {
+    return A6XX_SP_VS_CONFIG_ENABLED | COND(v->bindless_tex, A6XX_SP_VS_CONFIG_BINDLESS_TEX) |
+           COND(v->bindless_samp, A6XX_SP_VS_CONFIG_BINDLESS_SAMP) | COND(v->bindless_ibo, A6XX_SP_VS_CONFIG_BINDLESS_IBO) |
+           COND(v->bindless_ubo, A6XX_SP_VS_CONFIG_BINDLESS_UBO) | A6XX_SP_VS_CONFIG_NIBO(ir3_shader_nibo(v)) |
+           A6XX_SP_VS_CONFIG_NTEX(v->num_samp) | A6XX_SP_VS_CONFIG_NSAMP(v->num_samp);
+}
+
+// A sampled 2D texture's descriptor (Mesa's fdl6_layout + fdl6_view_init, linear RGBA8) at a given GPU address.
+static void texture_descriptor(const struct fd_dev_info *info, unsigned w, unsigned h, uint64_t iova, uint32_t out[16], uint32_t *pitch) {
+    struct fdl_layout layout;
+    memset(&layout, 0, sizeof layout);
+    layout.tile_mode = TILE6_LINEAR;
+    if (!fdl6_layout(&layout, info, PIPE_FORMAT_R8G8B8A8_UNORM, 1, w, h, 1, 1, 1, false, false, false, NULL)) {
+        fprintf(stderr, "fdl6_layout failed\n"); exit(1);
+    }
+    const struct fdl_layout *layouts[1] = {&layout};
+    const struct fdl_view_args args = {.chip = A7XX, .iova = iova, .base_miplevel = 0, .level_count = 1, .base_array_layer = 0,
+                                       .layer_count = 1, .min_lod_clamp = 0, .swiz = {PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W},
+                                       .format = PIPE_FORMAT_R8G8B8A8_UNORM, .type = FDL_VIEW_TYPE_2D};
+    struct fdl6_view view;
+    fdl6_view_init(&view, layouts, &args, false);
+    memcpy(out, view.descriptor, 16 * 4);
+    *pitch = fdl_pitch(&layout, 0);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: a740-compile vs|fs FILE.spv [OUT.json]\n       a740-compile link VS.spv FS.spv OUTDIR\n");
@@ -368,6 +422,8 @@ int main(int argc, char **argv) {
     struct fd_dev_id dev_id = {.gpu_id = 0, .chip_id = 0x43050a01};
     struct ir3_compiler *compiler = ir3_compiler_create(NULL, &dev_id, fd_dev_info_raw(&dev_id), &(struct ir3_compiler_options){0});
     if (!compiler) { fprintf(stderr, "no A740 compiler\n"); return 1; }
+    // Texture fetches as sam instructions, not the FS texture prefetch (SP_FS_PREFETCH_CMD state): one mechanism at a time.
+    compiler->has_fs_tex_prefetch = false;
     if (!strcmp(argv[1], "link")) {
         if (argc < 5) return 2;
         struct compiled vs = compile(compiler, MESA_SHADER_VERTEX, argv[2]), fs = compile(compiler, MESA_SHADER_FRAGMENT, argv[3]);
@@ -381,7 +437,34 @@ int main(int argc, char **argv) {
         emit_vpc(vs.v, fs.v);
         emit_fs_inputs(fd_dev_info_raw(&dev_id), fs.v);
         emit_fs_outputs(fs.v);
-        fprintf(regs_out, "]}\n");
+        reg(REG_A6XX_SP_VS_CONFIG, sp_xs_config(vs.v));
+        reg(REG_A6XX_SP_FS_CONFIG, sp_xs_config(fs.v));
+        fprintf(regs_out, "]");
+        if (fs.v->num_samp) {
+            // One 64x64 RGBA8 linear texture in slot 0 and one sampler (as Gallium's fd6_sampler_state_create for nearest filtering,
+            // clamp to edge, no mipmaps, non-seamless): the descriptor at address 0, and which bits an address changes.
+            const unsigned tw = 64, th = 64;
+            uint32_t d0[16], d1[16], pitch = 0, pitch1 = 0;
+            const uint64_t probe = 0x123456789000ull;
+            texture_descriptor(fd_dev_info_raw(&dev_id), tw, th, 0, d0, &pitch);
+            texture_descriptor(fd_dev_info_raw(&dev_id), tw, th, probe, d1, &pitch1);
+            fprintf(regs_out, ", \"tex\": {\"width\": %u, \"height\": %u, \"pitch\": %u, \"descriptor\": [", tw, th, pitch);
+            for (int i = 0; i < 16; i++) fprintf(regs_out, "%s%u", i ? ", " : "", d0[i]);
+            fprintf(regs_out, "], \"address_dwords\": [");
+            for (int i = 0, n = 0; i < 16; i++) if (d0[i] != d1[i]) fprintf(regs_out, "%s[%d, %u]", n++ ? ", " : "", i, d0[i] ^ d1[i]);
+            const uint32_t samp[4] = {
+                A6XX_TEX_SAMP_0_XY_MAG(A6XX_TEX_NEAREST) | A6XX_TEX_SAMP_0_XY_MIN(A6XX_TEX_NEAREST) | A6XX_TEX_SAMP_0_ANISO(A6XX_TEX_ANISO_1) |
+                    A6XX_TEX_SAMP_0_WRAP_S(A6XX_TEX_CLAMP_TO_EDGE) | A6XX_TEX_SAMP_0_WRAP_T(A6XX_TEX_CLAMP_TO_EDGE) |
+                    A6XX_TEX_SAMP_0_WRAP_R(A6XX_TEX_CLAMP_TO_EDGE) | A6XX_TEX_SAMP_0_LOD_BIAS(0.0f),
+                A6XX_TEX_SAMP_1_MIPFILTER_LINEAR_FAR | A6XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF | A6XX_TEX_SAMP_1_MIN_LOD(0.0f) |
+                    A6XX_TEX_SAMP_1_MAX_LOD(0.0f),
+                0, 0};
+            fprintf(regs_out, "], \"sampler\": [%u, %u, %u, %u], \"num_samp\": %d}", samp[0], samp[1], samp[2], samp[3], fs.v->num_samp);
+            printf("texture: pitch %u, descriptor %08x %08x %08x %08x ..., address bits in dwords:", pitch, d0[0], d0[1], d0[2], d0[3]);
+            for (int i = 0; i < 16; i++) if (d0[i] != d1[i]) printf(" %d(%08x)", i, d0[i] ^ d1[i]);
+            printf("; sampler %08x %08x\n", samp[0], samp[1]);
+        }
+        fprintf(regs_out, "}\n");
         fclose(regs_out);
         printf("wrote %s/{vs,fs,link}.json (%d linkage registers)\n", argv[4], regs_n);
         return 0;

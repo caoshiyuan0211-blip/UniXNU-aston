@@ -1,0 +1,242 @@
+diff --git a/A740TriProgram.h b/A740TriProgram.h
+index 651f61e..8ed7e61 100644
+--- a/A740TriProgram.h
++++ b/A740TriProgram.h
+@@ -13,13 +13,21 @@ struct A740TriReloc {uint16_t dword; uint8_t kind; uint32_t offset; uint8_t high
+ #define A740_TRI_COLOR 0xff0080ffu   /* ABGR8; a channel may round one step either way */
+ #define A740_TRI_AREA 1536   /* the triangle (-0.5,-0.5) (0.5,-0.5) (0,0.5) covers W*H/8 pixels */
+ 
+-// Stage 3a: the VS writes a per-vertex colour, the FS outputs it interpolated. The phone test computes every pixel's
+-// expected colour from these (clip-space positions, RGBA colours) with barycentrics at the pixel centre.
+-#define A740_TRI_GRADIENT 1
+-static const float kA740TriPos[3][2] = {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.0f, 0.5f}};
+-static const float kA740TriRgba[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};
++// Stage 3b: relocation kind 5 is the texture buffer: 64x64 RGBA8 linear texels (pitch 256) at 0, the texture descriptor
++// at A740_TRI_TEX_DESC_OFF (dword 4 = address low, dword 5 |= address high 17 bits) and the sampler at A740_TRI_TEX_SAMP_OFF.
++// The FS samples it nearest at the square (A740_TRI_TEX_X, A740_TRI_TEX_Y) + 64x64: pixel (x, y) shows texel (x - X, y - Y).
++#define A740_TRI_TEXTURE 1
++#define A740_TRI_TEX_W 64
++#define A740_TRI_TEX_H 64
++#define A740_TRI_TEX_PITCH 256
++#define A740_TRI_TEX_DESC_OFF 16384
++#define A740_TRI_TEX_SAMP_OFF 16448
++#define A740_TRI_TEX_X 32
++#define A740_TRI_TEX_Y 16
++static const uint32_t kA740TriTexDesc[16] = {0x0c006880, 0x00200040, 0x20008002, 0x00000004, 0x00000000, 0x00020000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000};
++static const uint32_t kA740TriTexSamp[4] = {0x00000920, 0x00000050, 0x00000000, 0x00000000};
+ 
+-static const uint32_t kA740TriIb[812] = {
++static const uint32_t kA740TriIb[828] = {
+     0x70970001, 0x08000001, 0x70460001, 0x00000019, 0x70460001, 0x00000018, 0x70460001, 0x00000028,
+     0x70460001, 0x00000033, 0x70268000, 0x48ab1f01, 0x01fffeff, 0x70268000, 0x408e0701, 0x00000068,
+     0x400e1701, 0x00040004, 0x40b60001, 0x13100000, 0x48b60201, 0x00000724, 0x40ae0301, 0x10001402,
+@@ -39,7 +47,7 @@ static const uint32_t kA740TriIb[812] = {
+     0x40a9cb01, 0x000000fc, 0x40a00701, 0x00000000, 0x40886401, 0x00000000, 0x48b30202, 0x00000000,
+     0x00000000, 0x40b18002, 0x00000000, 0x00000000, 0x408e0401, 0x00000000, 0x408e0101, 0x00000000,
+     0x488e0901, 0x00000007, 0x48b60885, 0x00000000, 0x3fe05ff4, 0x3fa0ebee, 0x3f5193ed, 0x3f0243f0,
+-    0x48988501, 0x00020000, 0x48988601, 0x00002000, 0x40a98001, 0x81500100, 0x40a82701, 0x00000102,
++    0x48988501, 0x00020000, 0x48988601, 0x00002000, 0x40a98001, 0x85d00100, 0x40a82701, 0x00000103,
+     0x48930a01, 0x00000000, 0x488c3401, 0x00000000, 0x4088e501, 0xc0000000, 0x70438003, 0x00040000,
+     0x00000000, 0x00000000, 0x70970001, 0x08000001, 0x70970001, 0x08000001, 0x70970001, 0x08000001,
+     0x70970001, 0x08000001, 0x48810001, 0x00000000, 0x40810b01, 0x00000000, 0x70dc000e, 0x00008103,
+@@ -78,27 +86,27 @@ static const uint32_t kA740TriIb[812] = {
+     0x70460001, 0x00000029, 0x409b0001, 0x00000000, 0x40910901, 0x00000000, 0x48980201, 0x00000000,
+     0x70dc800c, 0x0000b300, 0x00000000, 0x0000b301, 0x00000004, 0x000080a2, 0x00000000, 0x000080a3,
+     0x00000004, 0x00008802, 0x00000000, 0x00008803, 0x00000004, 0x70dc8018, 0x0000ab00, 0x00000005,
+-    0x0000ab1f, 0x0000009f, 0x0000a827, 0x00000102, 0x0000a83f, 0x00000000, 0x0000a867, 0x00000000,
++    0x0000ab1f, 0x0000009f, 0x0000a827, 0x00000103, 0x0000a83f, 0x00000000, 0x0000a867, 0x00000000,
+     0x0000a898, 0x00000000, 0x0000ab03, 0x00000101, 0x0000a823, 0x00000100, 0x0000a83b, 0x00000000,
+-    0x0000a863, 0x00000000, 0x0000a894, 0x00000000, 0x0000ab04, 0x00000100, 0x70dc0016, 0x0000a800,
+-    0x00100180, 0x0000a824, 0x00000002, 0x0000a81b, 0x00000000, 0x0000a81c, 0x00000000, 0x0000a81d,
++    0x0000a863, 0x00000000, 0x0000a894, 0x00000000, 0x0000ab04, 0x00020300, 0x70dc0016, 0x0000a800,
++    0x00100100, 0x0000a824, 0x00000001, 0x0000a81b, 0x00000000, 0x0000a81c, 0x00000000, 0x0000a81d,
+     0x00000000, 0x0000a81e, 0x00000000, 0x0000a81f, 0x00000000, 0x0000a820, 0x00000000, 0x0000a821,
+     0x00000000, 0x0000a825, 0x00000000, 0x0000a82d, 0x00000000, 0x489b0701, 0x00000006, 0x40a00801,
+     0x00000006, 0x40910c01, 0x00000006, 0x48910b01, 0x00000000, 0x48a00001, 0x00000000, 0x40a00101,
+-    0xfcfcfc00, 0x70328005, 0x00608001, 0x00000000, 0x00000000, 0x00000000, 0x00100000, 0x70328003,
+-    0x02224000, 0x00000000, 0x00000000, 0x40a00201, 0x0000fcfc, 0x48a00302, 0xfcfcfcfc, 0x000000fc,
+-    0x48a00501, 0x0000fcfc, 0x70dc0016, 0x0000a980, 0x81500100, 0x0000ab05, 0x00000001, 0x0000a982,
++    0xfcfcfc00, 0x70328005, 0x00608001, 0x00000000, 0x00000000, 0x00000000, 0x00180000, 0x70328003,
++    0x03224000, 0x00000000, 0x00000000, 0x40a00201, 0x0000fcfc, 0x48a00302, 0xfcfcfcfc, 0x000000fc,
++    0x48a00501, 0x0000fcfc, 0x70dc0016, 0x0000a980, 0x85d00100, 0x0000ab05, 0x00000001, 0x0000a982,
+     0x00000000, 0x0000a983, 0x00000000, 0x0000a984, 0x00000000, 0x0000a985, 0x00000000, 0x0000a986,
+     0x00000000, 0x0000a987, 0x00000000, 0x0000a988, 0x00000000, 0x0000a9a9, 0x00000000, 0x0000aa01,
+     0x00000000, 0x48a00601, 0x00000000, 0x40980601, 0x00000000, 0x40811001, 0x00000002, 0x40a99e01,
+     0x01ff7fc0, 0x40a9c785, 0x00000007, 0xfcfcfcfc, 0xfcfcfc00, 0xfcfcfcfc, 0x0000fcfc, 0x40a9ae01,
+     0x00000302, 0x48a9c601, 0x00000003, 0x40800501, 0x00000001, 0x48880902, 0x00000401, 0x00000000,
+-    0x40881001, 0x00000000, 0x40810101, 0x00000000, 0x48810901, 0x00000000, 0x40921204, 0xfffffff0,
+-    0xffffffff, 0xffffffff, 0xffffffff, 0x40930401, 0xff01ff04, 0x40a98c01, 0xfcfcfc00, 0x48a98e01,
+-    0x00000002, 0x48a98b01, 0x0000000f, 0x40aa0202, 0x00000000, 0x00000000, 0x40880b01, 0x00000000,
++    0x40881001, 0x00000000, 0x40810101, 0x00000000, 0x48810901, 0x00000000, 0x40921204, 0xfffffffc,
++    0xffffffff, 0xffffffff, 0xffffffff, 0x40930401, 0xff01ff02, 0x40a98c01, 0xfcfcfc00, 0x48a98e01,
++    0x00000004, 0x48a98b01, 0x0000000f, 0x40aa0202, 0x00000000, 0x00000000, 0x40880b01, 0x00000000,
+     0x40880d01, 0x0000000f, 0x70dc8006, 0x00009216, 0x00000000, 0x00009305, 0x00000000, 0x00009808,
+-    0x00000000, 0x70dc0016, 0x0000a803, 0x0f020f06, 0x0000a813, 0x00000400, 0x00009301, 0x00ff0408,
+-    0x00009101, 0x00ffff00, 0x00009311, 0x00ffff00, 0x00008001, 0x00000000, 0x00009b01, 0x00000008,
++    0x00000000, 0x70dc0016, 0x0000a803, 0x0f040302, 0x0000a813, 0x00000200, 0x00009301, 0x00ff0206,
++    0x00009101, 0x00ffff00, 0x00009311, 0x00ffff00, 0x00008001, 0x00000000, 0x00009b01, 0x00000006,
+     0x0000a802, 0x00000002, 0x00009104, 0x00ffffff, 0x00009314, 0x00ffffff, 0x0000809b, 0x00000000,
+     0x4080a001, 0x00000002, 0x48ab4004, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x48ab1f01,
+     0x01fe0000, 0x40a00e02, 0x00000000, 0x00000000, 0x48810001, 0x00000000, 0x40810b01, 0x00000000,
+@@ -117,37 +125,41 @@ static const uint32_t kA740TriIb[812] = {
+     0x00000100, 0x48886501, 0xffff0100, 0x40882002, 0x00000780, 0x00000000, 0x48a98d01, 0x00000001,
+     0x48880c01, 0x00000001, 0x4088f401, 0x00000000, 0x40a9ad01, 0x00000000, 0x4880f401, 0x00000000,
+     0x48ab4004, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x40920001, 0x00000000, 0x48920801,
+-    0x00000000, 0x70388003, 0x00000d84, 0x00000001, 0x00000003, 0x709d0001, 0x00000000, 0x48810001,
++    0x00000000, 0x70348003, 0x00520000, 0x00000000, 0x00000000, 0x70348003, 0x00524000, 0x00000000,
++    0x00000000, 0x40a9e002, 0x00000000, 0x00000000, 0x48a9e402, 0x00000000, 0x00000000, 0x40a9a701,
++    0x00000001, 0x70388003, 0x00000d84, 0x00000001, 0x00000006, 0x709d0001, 0x00000000, 0x48810001,
+     0x00000000, 0x40810b01, 0x00000000, 0x70460001, 0x00000026, 0x70438003, 0x00040000, 0x00000000,
+     0x00000000, 0x70460001, 0x00000021, 0x70460001, 0x00000033, 0x70268000, 0x70460004, 0x08000016,
+     0x00000000, 0x00000000, 0x00000001, 0x70bc8006, 0x00000013, 0x00000000, 0x00000000, 0x00000001,
+     0xffffffff, 0x00000010, 0x70460001, 0x00000032,
+ };
+-static const struct A740TriReloc kA740TriRelocs[20] = {
++static const struct A740TriReloc kA740TriRelocs[28] = {
+     {135, 3, 0, 0}, {136, 3, 0, 1}, {138, 3, 0, 0}, {139, 3, 0, 1},
+     {274, 2, 0, 0}, {275, 2, 0, 1}, {309, 2, 0, 0}, {311, 2, 0, 1},
+-    {494, 1, 0, 0}, {496, 1, 0, 1}, {525, 1, 256, 0}, {526, 129, 256, 1},
+-    {546, 1, 512, 0}, {548, 1, 512, 1}, {800, 4, 0, 0}, {801, 4, 0, 1},
+-    {805, 4, 0, 0}, {806, 4, 0, 1}, {529, 1, 256, 0}, {530, 1, 256, 1},
++    {494, 1, 0, 0}, {496, 1, 0, 1}, {525, 1, 192, 0}, {526, 129, 192, 1},
++    {546, 1, 512, 0}, {548, 1, 512, 1}, {816, 4, 0, 0}, {817, 4, 0, 1},
++    {821, 4, 0, 0}, {822, 4, 0, 1}, {529, 1, 192, 0}, {530, 1, 192, 1},
++    {779, 5, 16448, 0}, {780, 5, 16448, 1}, {783, 5, 16384, 0}, {784, 5, 16384, 1},
++    {786, 5, 16448, 0}, {787, 5, 16448, 1}, {789, 5, 16384, 0}, {790, 5, 16384, 1},
+ };
+ static const uint32_t kA740TriProgram[160] = {
+-    0x20020000, 0x46d00001, 0x20040000, 0x46d00000, 0x00000000, 0x204cc004, 0x00000001, 0x200d0002,
+-    0x20020000, 0x46f00000, 0x3f800000, 0x204cc005, 0x00000002, 0x201100f4, 0x00000000, 0x200d0000,
+-    0x00000000, 0x00000300, 0x00000c00, 0x200cc002, 0x00000c01, 0x200ce003, 0x00000000, 0x201100f4,
+-    0x00000000, 0x00000400, 0x00000c0c, 0x20044006, 0x00000c0d, 0x20044007, 0x00000c0e, 0x20044008,
+-    0x00000c0f, 0x20046009, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x20040000, 0x46d00001, 0x20020000, 0x46d00000, 0x00000000, 0x204cc006, 0x20020001, 0x46f00001,
++    0x00000000, 0x200d0000, 0x3f800000, 0x204cc007, 0x00000001, 0x200d0002, 0x00000000, 0x201100f4,
++    0x00000000, 0x00000400, 0x00000c00, 0x20044002, 0x00000c01, 0x20046003, 0x00000002, 0x201100f4,
++    0x00000000, 0x00000400, 0x00000c18, 0x200cc004, 0x00000c19, 0x200ce005, 0x00000000, 0x03000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x3f800000, 0x00000000, 0x00000000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000,
++    0x3f800000, 0x00000000, 0x00000000, 0x00000000, 0x3f800000, 0x3f800000, 0x00000000, 0x00000000,
++    0xbf000000, 0xbf2aaaab, 0x00000000, 0x00000000, 0x3f000000, 0xbf2aaaab, 0x00000000, 0x00000000,
++    0xbf000000, 0x3f2aaaab, 0x00000000, 0x00000000, 0xbf000000, 0x3f2aaaab, 0x00000000, 0x00000000,
++    0x3f000000, 0xbf2aaaab, 0x00000000, 0x00000000, 0x3f000000, 0x3f2aaaab, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-    0xbf000000, 0xbf000000, 0x00000000, 0x00000000, 0x3f000000, 0xbf000000, 0x00000000, 0x00000000,
+-    0x00000000, 0x3f000000, 0x00000000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, 0x3f800000,
+-    0x00000000, 0x3f800000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, 0x3f800000, 0x3f800000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+-    0x00002000, 0x47308b02, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00002000, 0x47308902, 0x00000000, 0x00000400, 0x00000005, 0xa0c01f04, 0x00000000, 0x13000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+diff --git a/NativeA740TriTest.h b/NativeA740TriTest.h
+index c0dd164..535677d 100644
+--- a/NativeA740TriTest.h
++++ b/NativeA740TriTest.h
+@@ -7,6 +7,9 @@
+ // (63 characters fit the driver's row: the step count is left out)
+ // Stage 2b: target size and colours come from the generated header (A740_TRI_W/H/CLEAR/COLOR, computed registers). Names in the
+ // report stay o (triangle colour) and b (clear colour). Pass: o within (W+H)/2 of A740_TRI_AREA and x0.
++// Stage 3b (A740_TRI_TEXTURE): two triangles sample a 64x64 RGBA8 texture (buffer kind 5, filled here with a distinct value per
++// texel) nearest at a 64x64 square; every square pixel must equal its texel exactly and every other pixel the clear colour.
++//   N f<compute> s o<texel-exact> b<clear> x<wrong> m<largest channel error> q<first wrong pixel> p<what it should be> c w e
+ // Included from NativeA740FillTest.h (the Gpu helpers and streamText come from NativeAdrenoUserTest.h).
+ 
+ namespace {
+@@ -33,10 +36,11 @@ static void a740TriTest(unsigned port, unsigned fillRight) {   // fillRight: sta
+         gpu.mark(0x6d00 | (step & 0xff));
+         return status == 0;
+     };
+-    // Buffers: IB, program (VS + its constant buffer, FS), colour target, border colours, control (the RB_DONE_TS seqno).
+-    enum {kIb, kProgram, kTarget, kBorder, kControl, kCount};
++    // Buffers: IB, program (VS + its constant buffer, FS), colour target, border colours, control (the RB_DONE_TS seqno), texture
++    // (stage 3b: texels, descriptor, sampler).
++    enum {kIb, kProgram, kTarget, kBorder, kControl, kTexture, kCount};
+     static_assert(A740_TRI_PITCH * A740_TRI_H <= 65536, "target");
+-    static const uint64_t kBytes[kCount] = {8192, 4096, 65536, 4096, 4096};
++    static const uint64_t kBytes[kCount] = {8192, 4096, 65536, 4096, 4096, 32768};
+     uint64_t handle[kCount] = {}, iova[kCount] = {}, cpu[kCount] = {}, cpuLen[kCount] = {};
+     uint32_t token[kCount] = {};
+     NativeAdrenoAbiDeviceInfo info = {};
+@@ -74,10 +78,22 @@ static void a740TriTest(unsigned port, unsigned fillRight) {   // fillRight: sta
+         for (unsigned i = 0; i < A740_TRI_PITCH * A740_TRI_H / 4; ++i) words(kTarget)[i] = 0x55555555;   // untouched pixels show as other
+         for (unsigned i = 0; i < 1024; ++i) words(kBorder)[i] = 0;
+         for (unsigned i = 0; i < 1024; ++i) words(kControl)[i] = 0;
++        for (unsigned i = 0; i < kBytes[kTexture] / 4; ++i) words(kTexture)[i] = 0;
++#ifdef A740_TRI_TEXTURE
++        static_assert(A740_TRI_TEX_SAMP_OFF + 16 <= 32768 && A740_TRI_TEX_PITCH * A740_TRI_TEX_H <= A740_TRI_TEX_DESC_OFF, "texture");
++        // A different value in every texel (x and y in their own bytes), so a wrong coordinate, swizzle or filter shows.
++        auto texel = [](unsigned x, unsigned y) {return 0xff000000u | (x * 4) | (y * 4) << 8 | (((x * 5 + y * 11) & 63) * 4) << 16;};
++        for (unsigned y = 0; y < A740_TRI_TEX_H; ++y)
++            for (unsigned x = 0; x < A740_TRI_TEX_W; ++x) words(kTexture)[y * (A740_TRI_TEX_PITCH / 4) + x] = texel(x, y);
++        for (unsigned i = 0; i < 16; ++i) words(kTexture)[A740_TRI_TEX_DESC_OFF / 4 + i] = kA740TriTexDesc[i];
++        words(kTexture)[A740_TRI_TEX_DESC_OFF / 4 + 4] = uint32_t(iova[kTexture]);                                    // texel base low
++        words(kTexture)[A740_TRI_TEX_DESC_OFF / 4 + 5] = kA740TriTexDesc[5] | uint32_t((iova[kTexture] >> 32) & 0x1ffff);   // high, depth above
++        for (unsigned i = 0; i < 4; ++i) words(kTexture)[A740_TRI_TEX_SAMP_OFF / 4 + i] = kA740TriTexSamp[i];
++#endif
+         for (unsigned i = 0; i < sizeof kA740TriIb / 4; ++i) words(kIb)[i] = kA740TriIb[i];
+         for (const auto &r : kA740TriRelocs) {
+             const unsigned kind = r.kind & 0x7f;
+-            const unsigned b = kind == 1 ? kProgram : kind == 2 ? kTarget : kind == 3 ? kBorder : kControl;
++            const unsigned b = kind == 1 ? kProgram : kind == 2 ? kTarget : kind == 3 ? kBorder : kind == 5 ? kTexture : kControl;
+             const uint64_t a = iova[b] + r.offset;
+             if (r.kind & 0x80) words(kIb)[r.dword] = words(kIb)[r.dword] | uint32_t((a >> 32) & 0x1ffff);   // UBO descriptor: size above
+             else words(kIb)[r.dword] = r.high ? uint32_t(a >> 32) : uint32_t(a);
+@@ -100,7 +116,24 @@ static void a740TriTest(unsigned port, unsigned fillRight) {   // fillRight: sta
+             for (unsigned c = 0; c < 32; c += 8) {const int d = int((a >> c) & 0xff) - int((b >> c) & 0xff); if (d < -1 || d > 1) return false;}
+             return true;
+         };
+-#ifdef A740_TRI_GRADIENT
++#if defined(A740_TRI_TEXTURE)
++        (void)near;
++        // Stage 3b: exact. Pixel centres map onto texel centres, so nearest sampling must return texel (x - X, y - Y) unchanged.
++        for (unsigned y = 0; y < A740_TRI_H; ++y)
++            for (unsigned x = 0; x < A740_TRI_W; ++x) {
++                const uint32_t p = words(kTarget)[y * (A740_TRI_PITCH / 4) + x];
++                const bool inside = x >= A740_TRI_TEX_X && x < A740_TRI_TEX_X + A740_TRI_TEX_W && y >= A740_TRI_TEX_Y && y < A740_TRI_TEX_Y + A740_TRI_TEX_H;
++                const uint32_t want = inside ? texel(x - A740_TRI_TEX_X, y - A740_TRI_TEX_Y) : A740_TRI_CLEAR;
++                if (p == want) {if (inside) ++orange; else ++blue; continue;}
++                for (unsigned c = 0; c < 32; c += 8) {
++                    const int d = int((p >> c) & 0xff) - int((want >> c) & 0xff);
++                    if (unsigned(d < 0 ? -d : d) > maxError) maxError = unsigned(d < 0 ? -d : d);
++                }
++                if (!other) {firstOther = p; centre = want;}
++                ++other;
++            }
++        if (!other) centre = words(kTarget)[(A740_TRI_H / 2) * (A740_TRI_PITCH / 4) + A740_TRI_W / 2];
++#elif defined(A740_TRI_GRADIENT)
+         (void)near;
+         // Stage 3a: every drawn pixel against the colour interpolated at its centre (barycentrics of the window-space triangle; the
+         // viewport maps clip x, y in [-1, 1] to [0, W] x [0, H]); within 3 steps per channel.
+@@ -139,7 +172,10 @@ static void a740TriTest(unsigned port, unsigned fillRight) {   // fillRight: sta
+ #endif
+     }
+     char text[64];
+-    #ifdef A740_TRI_GRADIENT
++#if defined(A740_TRI_TEXTURE)
++    snprintf(text, sizeof text, "N f%u s o%u b%u x%u m%u q%x p%x c%x w%d e%x", fillRight, orange, blue, other, maxError, firstOther, centre,
++             seqno, waitStatus, unsigned(error));
++#elif defined(A740_TRI_GRADIENT)
+     // g: o matched pixels, b background, x mismatched, m largest channel error, q first mismatch and p what it should have been
+     snprintf(text, sizeof text, "N f%u g o%u b%u x%u m%u q%x p%x c%x w%d e%x", fillRight, orange, blue, other, maxError, firstOther, centre,
+              seqno, waitStatus, unsigned(error));
+@@ -148,7 +184,12 @@ static void a740TriTest(unsigned port, unsigned fillRight) {   // fillRight: sta
+ #endif
+     streamText(gpu, text);
+     const unsigned slack = (A740_TRI_W + A740_TRI_H) / 2;   // edge pixels
++#ifdef A740_TRI_TEXTURE
++    (void)slack;
++    gpu.mark(orange == A740_TRI_TEX_W * A740_TRI_TEX_H && other == 0 ? 0x6dff : 0x6dfe);
++#else
+     gpu.mark(orange + slack >= A740_TRI_AREA && orange <= A740_TRI_AREA + slack && other == 0 ? 0x6dff : 0x6dfe);
++#endif
+     for (unsigned b = 0; b < kCount; ++b) {
+         if (!handle[b]) continue;
+         if (cpu[b]) {

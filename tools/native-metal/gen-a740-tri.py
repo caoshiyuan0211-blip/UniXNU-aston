@@ -179,12 +179,16 @@ def load_state0(dst_off, state_type, state_src, block, units):
     # CP_LOAD_STATE6_0: DST_OFF[13:0] STATE_TYPE[15:14] STATE_SRC[17:16] STATE_BLOCK[21:18] NUM_UNIT[31:22]
     return dst_off | state_type << 14 | state_src << 16 | block << 18 | units << 22
 
-ST6_CONSTANTS, ST6_UBO, SS6_DIRECT, SS6_INDIRECT, SB6_VS_SHADER, SB6_FS_SHADER = 1, 2, 0, 2, 8, 12
+ST6_SHADER, ST6_CONSTANTS, ST6_UBO, SS6_DIRECT, SS6_INDIRECT, SB6_FS_TEX, SB6_VS_SHADER, SB6_FS_SHADER = 0, 1, 2, 0, 2, 4, 8, 12
+# Stage 3b texture buffer (relocation kind 5): the texels at 0, the texture descriptor and the sampler after them (64-byte aligned).
+TEX_KIND = 5
 
 def stage2c(o, d, color):
     import json, math
     vs, fs = json.load(open(d / 'vs.json')), json.load(open(d / 'fs.json'))
-    link = json.load(open(d / 'link.json'))['regs'] if (d / 'link.json').exists() else None
+    linkfile = json.load(open(d / 'link.json')) if (d / 'link.json').exists() else None
+    link = linkfile['regs'] if linkfile else None
+    tex = linkfile.get('tex') if linkfile else None
     if link is None:
         # Stage 2c: what the stream already says, and our layout must agree with (the registers this stage does not compute).
         assert vs['outputs'] == [[0, reg_value(o.words, 0xa803) & 0xff]], 'VS position output regid (SP_VS_OUT_REG[0])'
@@ -256,6 +260,27 @@ def stage2c(o, d, color):
         assert fs['push_consts_dwords'] == 4
         push = [pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3 + 4), load_state0(fs['push_consts_vec4'], ST6_CONSTANTS, SS6_DIRECT, SB6_FS_SHADER, 1), 0, 0] + [f32(c) for c in color]
         insert(o, draw[0], push)
+    if tex:
+        # Stage 3b: one texture and one sampler in the FS's (non-bindless) tables, as Gallium's fd6_emit_textures: CP_LOAD_STATE6
+        # of the sampler (ST6_SHADER) and descriptor (ST6_CONSTANTS) from memory, and the table registers the TP reads them from.
+        assert tex['num_samp'] == 1 and tex['address_dwords'][0][0] == 4 and tex['address_dwords'][1][0] == 5
+        draw = find_packets(o.words, lambda p: op(p) == OPS['CP_DRAW_INDX_OFFSET'])[0]
+        desc_off = (tex['pitch'] * tex['height'] + 63) // 64 * 64
+        samp_off = desc_off + 64
+        w = [pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3), load_state0(0, ST6_SHADER, SS6_INDIRECT, SB6_FS_TEX, 1), 0, 0,
+             pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3), load_state0(0, ST6_CONSTANTS, SS6_INDIRECT, SB6_FS_TEX, 1), 0, 0,
+             pkt4(R['A6XX_SP_FS_TEX_SAMP'], 2), 0, 0, pkt4(R['A6XX_SP_FS_TEX_CONST'], 2), 0, 0, pkt4(R['A6XX_SP_FS_TEX_COUNT'], 1), 1]
+        rel = []
+        for at, off in ((2, samp_off), (6, desc_off), (9, samp_off), (12, desc_off)):
+            rel += [(at, TEX_KIND, off, 0), (at + 1, TEX_KIND, off, 1)]
+        insert(o, draw, w, rel)
+        tex['desc_off'], tex['samp_off'] = desc_off, samp_off
+        # Two triangles: the draw's vertex count (CP_DRAW_INDX_OFFSET_2 NUM_INDICES) 3 -> 6.
+        draw = find_packets(o.words, lambda p: op(p) == OPS['CP_DRAW_INDX_OFFSET'])[0]
+        assert o.words[draw + 3] == 3, 'the recorded draw is one triangle'
+        o.words[draw + 3] = 6
+        o.tex = tex
+        print(f"stage 3b: texture {tex['width']}x{tex['height']} pitch {tex['pitch']}, descriptor at {desc_off:#x}, sampler at {samp_off:#x}; 6 vertices")
     check_headers(o.words)
     print('stage 2c: our shaders; computed', ', '.join(f'{next((k for k, v in R.items() if v == r), hex(r))} {before[r]:#x}->{values[r]:#x}' for r in values))
     return prog, fs_offset
@@ -435,6 +460,19 @@ def main():
                     '#define A740_TRI_GRADIENT 1\n'
                     'static const float kA740TriPos[3][2] = {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.0f, 0.5f}};\n'
                     'static const float kA740TriRgba[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};\n\n')
+        tex = getattr(o, 'tex', None)
+        if tex:
+            f.write('// Stage 3b: relocation kind 5 is the texture buffer: %dx%d RGBA8 linear texels (pitch %d) at 0, the texture descriptor\n'
+                    '// at A740_TRI_TEX_DESC_OFF (dword 4 = address low, dword 5 |= address high 17 bits) and the sampler at A740_TRI_TEX_SAMP_OFF.\n'
+                    '// The FS samples it nearest at the square (A740_TRI_TEX_X, A740_TRI_TEX_Y) + 64x64: pixel (x, y) shows texel (x - X, y - Y).\n'
+                    '#define A740_TRI_TEXTURE 1\n#define A740_TRI_TEX_W %d\n#define A740_TRI_TEX_H %d\n#define A740_TRI_TEX_PITCH %d\n'
+                    '#define A740_TRI_TEX_DESC_OFF %d\n#define A740_TRI_TEX_SAMP_OFF %d\n#define A740_TRI_TEX_X %d\n#define A740_TRI_TEX_Y %d\n'
+                    % (tex['width'], tex['height'], tex['pitch'], tex['width'], tex['height'], tex['pitch'], tex['desc_off'], tex['samp_off'],
+                       W // 4, H // 6))
+            arr0 = lambda name, w: f.write('static const uint32_t %s[%d] = {%s};\n' % (name, len(w), ', '.join('0x%08x' % x for x in w)))
+            arr0('kA740TriTexDesc', tex['descriptor'])
+            arr0('kA740TriTexSamp', tex['sampler'])
+            f.write('\n')
         def arr(name, w):
             f.write('static const uint32_t %s[%d] = {' % (name, len(w)))
             for i, x in enumerate(w): f.write(('\n    ' if i % 8 == 0 else ' ') + '0x%08x,' % x)
