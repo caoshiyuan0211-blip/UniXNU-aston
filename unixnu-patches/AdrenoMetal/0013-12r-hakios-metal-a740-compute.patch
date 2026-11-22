@@ -28,10 +28,10 @@ index b9127d4..fbce4fe 100644
  }
 diff --git a/NativeHakiosA740Test.h b/NativeHakiosA740Test.h
 new file mode 100644
-index 0000000..307c39c
+index 0000000..42eea39
 --- /dev/null
 +++ b/NativeHakiosA740Test.h
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,199 @@
 +// SPDX-License-Identifier: MIT
 +// Native Metal stage 4a on the OnePlus 12R's A740 (boot argument native-a740-fill=1, after the stage 1-3 tests): hakios-metal's own
 +// driver (MIT, vendored as hakios-metal/: its command queue, command buffer and compute encoder, ported to a7xx) runs fill_id through
@@ -87,6 +87,10 @@ index 0000000..307c39c
 +    unsigned right = 0;
 +    uint32_t first = 0, second = 0;
 +    unsigned raw = 0;
++    uint32_t rawFirst = 0;
++    // the kernel's fault count (GetStatus: a change means a context was lost) before the test and after each step: replay, compute, draw
++    uint64_t faults[4] = {};
++    auto faultsNow = []() {NativeAdrenoAbiStatus st = {}; return gpu.method(NativeAdrenoMethodGetStatus, nullptr, 0, &st, sizeof st) == 0 ? st.faults : ~0ull;};
 +    unsigned drawn = 0, wrong = 0, worst = 0;   // stage 4b: pixels of the draw within 3 steps of their colour, the others, the largest error
 +    uint32_t firstWrong = 0;   // stage 1's stream through the transport: words right (8888 no buffers, 9999 submit or wait failed)   // what the GPU left in words 0 and 1 (0x55555555: nothing written)
 +    int64_t gpuNs = 0;
@@ -96,6 +100,7 @@ index 0000000..307c39c
 +    if (transport) {
 +        ++step;
 +        hm::Gpu device(std::move(transport));
++        faults[0] = faultsNow();
 +        if (device.chipId() != hm::kChipA740) why = "chip " + std::to_string(device.chipId());
 +        // r: stage 1's own stream (kA740FillIb, which ran right on this GPU) through this transport's buffers, addresses, submit and
 +        // wait. r1024 with v0 puts the fault in hakios's queue or command buffer; r0 puts it in the transport.
@@ -127,9 +132,11 @@ index 0000000..307c39c
 +                if (device.submit(0, *bo[0], 0, sizeof kA740FillIb / 4, uses, &fence) == 0 && device.wait(0, fence, 1000000000) == 0) {
 +                    for (unsigned gid = 0; gid < A740_FILL_COUNT; ++gid)
 +                        if (w(3)[gid] == gid * A740_FILL_K + A740_FILL_C) ++raw;
++                    rawFirst = w(3)[0];
 +                } else raw = 9999;
 +            } else raw = 8888;
 +        }
++        faults[1] = faultsNow();
 +        auto queue = why.empty() ? hm::CommandQueue::make(device, &why) : nullptr;
 +        auto out = queue ? hm::newBuffer(device, 4096, &why) : nullptr;
 +        if (queue && out) {
@@ -154,6 +161,7 @@ index 0000000..307c39c
 +            } else if (cb) {
 +                why = cb->error();
 +            }
++            faults[2] = faultsNow();
 +            // Stage 4b: hakios's draw of tri_color (two triangles over the whole 128x96 RGBA8 target, a pixel's colour its barycentric
 +            // weights: red + green + blue = 1) through its a7xx rewrite; every pixel against the colour at its centre
 +            hm::TextureDesc td;
@@ -213,7 +221,11 @@ index 0000000..307c39c
 +        }
 +    }
 +    char text[64];
-+    snprintf(text, sizeof text, "N hk v%u r%u d%u x%u m%u q%x %s", right, raw, drawn, wrong, worst, firstWrong, why.c_str());
++    faults[3] = faultsNow();
++    // f: the fault count's rise after the replay / the compute / the draw; a, b: word 0 of the replay's and the compute's output
++    snprintf(text, sizeof text, "N hk v%u r%u d%u x%u f%u/%u/%u a%x b%x %s", right, raw, drawn, wrong, unsigned(faults[1] - faults[0]),
++             unsigned(faults[2] - faults[1]), unsigned(faults[3] - faults[2]), rawFirst, first, why.c_str());
++    (void)worst; (void)firstWrong;
 +    (void)first; (void)second; (void)step; (void)gpuNs;
 +    streamText(gpu, text);
 +    gpu.mark(right == 1024 && drawn == 128 * 96 ? 0x6eff : 0x6efe);
