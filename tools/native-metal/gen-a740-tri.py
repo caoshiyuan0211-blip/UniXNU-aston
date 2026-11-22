@@ -116,11 +116,11 @@ def params(W, H, clear, color):
     for i, c in enumerate(color): v[0xab40 + i] = f32(c)                    # HLSQ_SHARED_CONSTS_IMM: the FS colour (push constant)
     return v
 
-def apply(words, values, verify):
+def apply(words, values, verify, start=0):
     """Write `values` into every pkt4 / CP_CONTEXT_REG_BUNCH write of those registers. With verify, require the stream to hold
     exactly those values already (the self-check against Turnip's recording). Returns {register: occurrences}."""
     seen = {}
-    i = 0
+    i = start
     while i < len(words):
         h = words[i]
         if h >> 28 == 4:
@@ -184,13 +184,15 @@ ST6_CONSTANTS, ST6_UBO, SS6_DIRECT, SS6_INDIRECT, SB6_VS_SHADER, SB6_FS_SHADER =
 def stage2c(o, d, color):
     import json, math
     vs, fs = json.load(open(d / 'vs.json')), json.load(open(d / 'fs.json'))
-    # What the stream already says, and our layout must agree with (the registers this stage does not compute):
-    assert vs['outputs'] == [[0, reg_value(o.words, 0xa803) & 0xff]], 'VS position output regid (SP_VS_OUT_REG[0])'
-    assert (reg_value(o.words, 0xa803) >> 8) & 0xf == 0xf, 'position written as xyzw'
+    link = json.load(open(d / 'link.json'))['regs'] if (d / 'link.json').exists() else None
+    if link is None:
+        # Stage 2c: what the stream already says, and our layout must agree with (the registers this stage does not compute).
+        assert vs['outputs'] == [[0, reg_value(o.words, 0xa803) & 0xff]], 'VS position output regid (SP_VS_OUT_REG[0])'
+        assert (reg_value(o.words, 0xa803) >> 8) & 0xf == 0xf, 'position written as xyzw'
+        assert fs['outputs'] == [[4, reg_value(o.words, 0xa98e) & 0xff]], 'FS colour output regid (SP_FS_OUTPUT_REG[0])'
+        assert fs['total_in'] == 0
     assert [i[1] for i in vs['inputs'] if i[0] == 9] == [reg_value(o.words, R['A6XX_VFD_CONTROL_1']) & 0xff], 'vertex id regid (VFD_CONTROL_1)'
-    assert fs['outputs'] == [[4, reg_value(o.words, 0xa98e) & 0xff]], 'FS colour output regid (SP_FS_OUTPUT_REG[0])'
-    assert fs['total_in'] == 0 and fs['push_consts_dwords'] == 4 and vs['push_consts_dwords'] == 0
-    assert vs['consts_ubo'] == 1 and fs['consts_ubo'] == -1, 'constant-data UBO slots as in the stream'
+    assert vs['consts_ubo'] in (1, -1) and fs['consts_ubo'] == -1, 'constant-data UBO slots as in the stream'
     # tu6_emit_xs (Turnip): SP_xS_CTRL_REG0 from the variant; tu6_emit_xs_config: HLSQ_xS_CNTL constlen (>> 2) | enabled
     def ctrl0(v, fs_stage):
         w = (v['max_half_reg'] + 1) << 1 | (v['max_reg'] + 1) << 7 | v['branchstack_hw'] << 14
@@ -211,6 +213,21 @@ def stage2c(o, d, color):
     for i in range(4): values[0xab40 + i] = 0
     before = {r: reg_value(o.words, r) for r in values}
     apply(o.words, values, verify=False)
+    if link is not None:
+        # Stage 3: the linkage registers a740-compile computed with Turnip's tu6_emit_vpc / tu6_emit_fs_inputs / tu6_emit_fs_outputs
+        # (self-checked: for the smoke pair all equal Turnip's recorded values). Registers the stream never writes go in before the draw.
+        lv = dict((r, v) for r, v in link)
+        # Only the draw's own state: from the render pass marker on (Turnip's hardware init writes some of these too, e.g.
+        # HLSQ_CONTROL_5_REG, and is left as recorded).
+        marker = find_packets(o.words, lambda p: op(p) == OPS['CP_SET_MARKER'])[0]
+        seen = apply(o.words, lv, verify=False, start=marker)
+        missing = [r for r in lv if r not in seen]
+        if missing:
+            draw = find_packets(o.words, lambda p: op(p) == OPS['CP_DRAW_INDX_OFFSET'])[0]
+            add = []
+            for r in sorted(missing): add += [pkt4(r, 1), lv[r]]
+            insert(o, draw, add)
+        print(f'stage 3: {len(lv)} linkage registers ({len(missing)} added)')
     # Program buffer: our VS (code + constant data) at 0, our FS at the next 256-byte boundary (instrlen units are 128 bytes).
     vsw, fsw = vs['words'], fs['words']
     fs_offset = (len(vsw) * 4 + 255) // 256 * 256
@@ -219,7 +236,7 @@ def stage2c(o, d, color):
     o.relocs = [(dd, k, fs_offset if (k == 1 and off == PROG_VS_BYTES) else off, h) for dd, k, off, h in o.relocs]
     # The constant-data UBO descriptor (Turnip loads it from its preamble; we keep it) now points at our constant data ...
     ubo = find_packets(o.words, lambda p: op(p) == OPS['CP_LOAD_STATE6_GEOM'] and len(p) == 6 and (p[1] >> 14) & 3 == ST6_UBO)
-    assert len(ubo) == 1
+    assert len(ubo) == 1 and vs['consts_ubo'] == 1, 'the VS keeps its constant data in UBO 1, as the recorded stream'
     u = ubo[0]
     o.words[u + 5] = math.ceil(vs['constant_data_size'] / 16) << 17          # A6XX_UBO_1_SIZE (vec4), the address high bits ORed in
     o.relocs = [(dd, k, vs['constant_data_offset'] if dd in (u + 4, u + 5) else off, h) for dd, k, off, h in o.relocs]
@@ -235,8 +252,10 @@ def stage2c(o, d, color):
     # The FS push constants (the colour) into its const file, direct, right before the draw.
     draw = find_packets(o.words, lambda p: op(p) == OPS['CP_DRAW_INDX_OFFSET'])
     assert len(draw) == 1
-    push = [pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3 + 4), load_state0(fs['push_consts_vec4'], ST6_CONSTANTS, SS6_DIRECT, SB6_FS_SHADER, 1), 0, 0] + [f32(c) for c in color]
-    insert(o, draw[0], push)
+    if fs['push_consts_dwords']:
+        assert fs['push_consts_dwords'] == 4
+        push = [pkt7(OPS['CP_LOAD_STATE6_FRAG'], 3 + 4), load_state0(fs['push_consts_vec4'], ST6_CONSTANTS, SS6_DIRECT, SB6_FS_SHADER, 1), 0, 0] + [f32(c) for c in color]
+        insert(o, draw[0], push)
     check_headers(o.words)
     print('stage 2c: our shaders; computed', ', '.join(f'{next((k for k, v in R.items() if v == r), hex(r))} {before[r]:#x}->{values[r]:#x}' for r in values))
     return prog, fs_offset
@@ -249,6 +268,7 @@ def main():
     ap.add_argument('--size', type=int, nargs=2, default=[64, 64])
     ap.add_argument('--clear', type=float, nargs=4, default=[0.0, 0.0, 1.0, 1.0])
     ap.add_argument('--color', type=float, nargs=4, default=[1.0, 0.5, 0.0, 1.0])
+    ap.add_argument('--gradient', action='store_true', help='stage 3a: the shaders interpolate a per-vertex colour (red, green, blue)')
     ap.add_argument('--shaders', help='stage 2c: DIR with vs.json and fs.json from a740-compile (our own binaries)')
     args = ap.parse_args()
     rdfile = glob.glob(str(HERE / 'capture/*submit00002.rd'))[0]
@@ -409,6 +429,12 @@ def main():
                 '#define A740_TRI_CLEAR 0x%08xu   /* ABGR8 */\n#define A740_TRI_COLOR 0x%08xu   /* ABGR8; a channel may round one step either way */\n'
                 '#define A740_TRI_AREA %d   /* the triangle (-0.5,-0.5) (0.5,-0.5) (0,0.5) covers W*H/8 pixels */\n\n'
                 % (fs_offset, W, H, (W * 4 + 63) // 64 * 64, abgr(args.clear), abgr(args.color), W * H // 8))
+        if args.gradient:
+            f.write('// Stage 3a: the VS writes a per-vertex colour, the FS outputs it interpolated. The phone test computes every pixel\'s\n'
+                    '// expected colour from these (clip-space positions, RGBA colours) with barycentrics at the pixel centre.\n'
+                    '#define A740_TRI_GRADIENT 1\n'
+                    'static const float kA740TriPos[3][2] = {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.0f, 0.5f}};\n'
+                    'static const float kA740TriRgba[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};\n\n')
         def arr(name, w):
             f.write('static const uint32_t %s[%d] = {' % (name, len(w)))
             for i, x in enumerate(w): f.write(('\n    ' if i % 8 == 0 else ' ') + '0x%08x,' % x)
