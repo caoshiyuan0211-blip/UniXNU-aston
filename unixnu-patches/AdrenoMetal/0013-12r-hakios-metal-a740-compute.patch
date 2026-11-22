@@ -5612,10 +5612,10 @@ index 0000000..607f38d
 +}  // namespace hakios::metal::a7xx
 diff --git a/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp b/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp
 new file mode 100644
-index 0000000..4fd6b6a
+index 0000000..7ee04a5
 --- /dev/null
 +++ b/hakios-metal/include/hakios-metal/a7xx_rewrite.hpp
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,12 @@
 +// SPDX-License-Identifier: MIT
 +// A finished command buffer rewritten for the Adreno 740 (a7xx): src/a7xx_rewrite.cpp says what changes and why.
 +#pragma once
@@ -5624,6 +5624,9 @@ index 0000000..4fd6b6a
 +
 +namespace hakios::metal {
 +std::vector<uint32_t> a7xxRewrite(const std::vector<uint32_t>& words);
++// A CP_NOP carrying one of these words brackets packets already in the a7xx form (compute.cpp's dispatches): the rewrite copies
++// them as they are. (Registers at the same offset can mean different things on a6xx and a7xx: SP_CS_OBJ_START's is one.)
++constexpr uint32_t kA7xxNativeBegin = 0x41377b00u, kA7xxNativeEnd = 0x41377b01u;
 +}  // namespace hakios::metal
 diff --git a/hakios-metal/include/hakios-metal/chip.hpp b/hakios-metal/include/hakios-metal/chip.hpp
 new file mode 100644
@@ -8991,10 +8994,10 @@ index 0000000..8e929cd
 +} // namespace hakios::metal::kernels
 diff --git a/hakios-metal/src/a7xx_rewrite.cpp b/hakios-metal/src/a7xx_rewrite.cpp
 new file mode 100644
-index 0000000..8d469fb
+index 0000000..13d3363
 --- /dev/null
 +++ b/hakios-metal/src/a7xx_rewrite.cpp
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,211 @@
 +// SPDX-License-Identifier: MIT
 +// hakios-metal's command streams for the Adreno 740 (a7xx, OnePlus 12R): its draw path writes the A635's (a6xx) registers and
 +// events; this rewrites a finished command buffer into the a7xx form, with every table generated from Mesa's register XML and from
@@ -9180,10 +9183,18 @@ index 0000000..8d469fb
 +        }
 +    }
 +    Rewriter rw(out);
++    bool native = false;   // inside kA7xxNativeBegin .. kA7xxNativeEnd: copied as it is
 +    for (size_t i = 0; i < in.size();) {
 +        const pm4::Header h = pm4::decode(in[i]);
 +        const uint32_t* w = &in[i + 1];
-+        if (h.kind == pm4::Header::kRegisters) {
++        if (h.kind == pm4::Header::kCommand && h.opcode == pm4::kNop && h.count == 1 && (w[0] == kA7xxNativeBegin || w[0] == kA7xxNativeEnd)) {
++            native = w[0] == kA7xxNativeBegin;
++            i += 2;
++            continue;
++        }
++        if (native) {
++            for (uint32_t k = 0; k <= h.count; k++) out.raw(in[i + k]);
++        } else if (h.kind == pm4::Header::kRegisters) {
 +            for (uint32_t k = 0; k < h.count; k++) rw.reg(h.reg + k, w[k]);
 +        } else if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_EVENT_WRITE && h.count >= 1) {
 +            rw.event(w, h.count);
@@ -9904,12 +9915,13 @@ index 0000000..fac056a
 +}  // namespace hakios::metal
 diff --git a/hakios-metal/src/compute.cpp b/hakios-metal/src/compute.cpp
 new file mode 100644
-index 0000000..be5a90f
+index 0000000..cc8981f
 --- /dev/null
 +++ b/hakios-metal/src/compute.cpp
-@@ -0,0 +1,744 @@
+@@ -0,0 +1,747 @@
 +#include "hakios-metal/compute.hpp"
 +#include "hakios-metal/a7xx.hpp"
++#include "hakios-metal/a7xx_rewrite.hpp"
 +
 +#include <algorithm>
 +#include <cstring>
@@ -10621,6 +10633,7 @@ index 0000000..be5a90f
 +    closePass();   // a dispatch reads what the draws before it wrote: their pass's tail first
 +    stampStart(kPassDispatch, groups ? groups[0] : 0, groups ? groups[1] : 0);
 +    stream_.packet(pm4::kNop, nullptr, 0);   // (a marker between encoders in the stream, for whoever reads it back)
++    if (options.a7xx) stream_.packet(pm4::kNop, &kA7xxNativeBegin, 1);   // already a7xx: the submit-time rewrite leaves it alone
 +    for (size_t i = 0; i < w.size();) {
 +        pm4::Header h = pm4::decode(w[i]);
 +        // the encoder's packets are copied whole; Stream has no append, and the header is re-read only to find each end
@@ -10631,6 +10644,7 @@ index 0000000..be5a90f
 +        }
 +        i += 1 + h.count;
 +    }
++    if (options.a7xx) stream_.packet(pm4::kNop, &kA7xxNativeEnd, 1);
 +    stampEnd();
 +    for (const Binding& bb : bindings.buffers) {
 +        if (bb.buffer != nullptr) {
