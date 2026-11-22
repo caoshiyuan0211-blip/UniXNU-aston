@@ -28,10 +28,10 @@ index b9127d4..fbce4fe 100644
  }
 diff --git a/NativeHakiosA740Test.h b/NativeHakiosA740Test.h
 new file mode 100644
-index 0000000..5ece7dd
+index 0000000..732c0ca
 --- /dev/null
 +++ b/NativeHakiosA740Test.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,85 @@
 +// SPDX-License-Identifier: MIT
 +// Native Metal stage 4a on the OnePlus 12R's A740 (boot argument native-a740-fill=1, after the stage 1-3 tests): hakios-metal's own
 +// driver (MIT, vendored as hakios-metal/: its command queue, command buffer and compute encoder, ported to a7xx) runs fill_id through
@@ -70,8 +70,9 @@ index 0000000..5ece7dd
 +        return gpu.method(selector, in, inSize, out, outSize);
 +    };
 +    calls.mapMemory = [](uint32_t token, uint64_t *address, uint64_t *length) {
-+        // uncached, as the passing tests map their buffers (0x101: anywhere + inhibit cache)
-+        return int(gpu.map(gpu.conn, token, mach_task_self(), address, length, 0x101));
++        // write-combined (0x401: anywhere + Normal non-cacheable): hakios writes buffers and command streams with memcpy, which may
++        // store unaligned or use DC ZVA, and only the uncached mode's aligned dword accesses are safe on 0x101 (NativeAdrenoUserTest.h)
++        return int(gpu.map(gpu.conn, token, mach_task_self(), address, length, 0x401));
 +    };
 +    calls.unmapMemory = [](uint32_t token, uint64_t address) { gpu.unmap(gpu.conn, token, mach_task_self(), address); };
 +    calls.nowNs = []() { return int64_t(mach_continuous_time() * timebase.numer / timebase.denom); };
@@ -9775,7 +9776,7 @@ index 0000000..e5fc9a2
 +}  // namespace hakios::metal::render
 diff --git a/hakios-metal/src/native_adreno_transport.cpp b/hakios-metal/src/native_adreno_transport.cpp
 new file mode 100644
-index 0000000..90151db
+index 0000000..f5695c8
 --- /dev/null
 +++ b/hakios-metal/src/native_adreno_transport.cpp
 @@ -0,0 +1,319 @@
@@ -9786,7 +9787,7 @@ index 0000000..90151db
 +// transport keeps its own address space: a bump allocator over [va_start, va_start + va_size) with exact-size reuse.
 +//
 +// Buffers are mapped as the passing tests map them: GPU read (+ write unless read-only), normal non-coherent, outer
-+// shareable; the CPU view uncached (IOConnectMapMemory64 options 0x101). Fences: the ABI's are 64-bit CP timestamps, msm's
++// shareable; the CPU view is the caller's mapMemory (write-combined on the phone: hakios uses memcpy). Fences: the ABI's are 64-bit CP timestamps, msm's
 +// 32-bit; the low halves are kept and widened against the last fence handed out.
 +#include "hakios-metal/native_adreno_transport.hpp"
 +
@@ -10058,8 +10059,8 @@ index 0000000..90151db
 +    }
 +
 +    int queueNew(MsmSubmitQueue& q) {
-+        NaQueue r{};
-+        if (k_.method(kNaCreateQueue, nullptr, 0, &r, sizeof r) != 0 || !r.queue) return ENOMEM;
++        NaQueue request{0}, r{};   // the client's input is a NativeAdrenoAbiQueue with queue 0 (NativeAdrenoUserClient::inputSize)
++        if (k_.method(kNaCreateQueue, &request, sizeof request, &r, sizeof r) != 0 || !r.queue) return ENOMEM;
 +        const uint32_t id = nextQueue_++;
 +        queues_[id] = r.queue;
 +        q.id = id;
