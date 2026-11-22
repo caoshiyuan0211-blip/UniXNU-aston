@@ -96,11 +96,20 @@ void printRelocs(FILE *f, const char *name, const std::vector<Reloc> &r) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    if (argc != 2) {fprintf(stderr, "usage: gen-a740-fill OUT.h\n"); return 2;}
+    if (argc != 2 && !(argc == 3 && !strcmp(argv[1], "--magic"))) {fprintf(stderr, "usage: gen-a740-fill OUT.h | --magic OUT.txt\n"); return 2;}
     const auto &k = hakios::metal::kernels::fill_id_a740;
     const fd_dev_id id = {0, 0x43050a01};
     const struct fd_dev_info *info = fd_dev_info_raw(&id);
     if (!info || info->chip != 7) {fprintf(stderr, "no A740 (gen 7) row in Mesa's device table\n"); return 1;}
+    if (argc == 3) {   // the A740's magic registers and instruction cache size, for hakios-metal's a7xx.hpp
+        FILE *m = fopen(argv[2], "w");
+        if (!m) return 1;
+        for (size_t i = 0; i < sizeof info->a6xx.magic_raw / sizeof info->a6xx.magic_raw[0] && info->a6xx.magic_raw[i].reg; ++i)
+            fprintf(m, "0x%x 0x%x\n", unsigned(info->a6xx.magic_raw[i].reg), unsigned(info->a6xx.magic_raw[i].value));
+        fclose(m);
+        printf("instr_cache_size %u\n", info->a6xx.instr_cache_size);
+        return 0;
+    }
     const uint32_t groups[3] = {16, 1, 1};
     const unsigned threadsize = k.doubleThreadsize ? THREAD128 : THREAD64;
 

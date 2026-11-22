@@ -11,3 +11,4 @@ DEFS=$(grep -m1 -A4 '^build src/freedreno/ir3/libfreedreno_ir3.a.p/ir3.c.o:' $B/
   -o "$HERE/out/gen-a740-fill" "$HERE/gen-a740-fill.cc" $B/src/freedreno/common/libfreedreno_common.a $B/src/util/libmesa_util.a \
   $B/src/c11/impl/libmesa_util_c11.a $B/src/util/blake3/libblake3.a -lz -lm -pthread
 "$HERE/out/gen-a740-fill" "$HERE/out/A740FillProgram.h"
+"$HERE/out/gen-a740-fill" --magic "$HERE/out/a740-magic.txt"

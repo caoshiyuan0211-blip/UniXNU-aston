@@ -1,0 +1,32 @@
+diff --git a/scripts/build-adreno-metal-plugin.py b/scripts/build-adreno-metal-plugin.py
+index 8e17794..6481986 100644
+--- a/scripts/build-adreno-metal-plugin.py
++++ b/scripts/build-adreno-metal-plugin.py
+@@ -81,6 +81,16 @@ if IOS27:
+     link_extra = [boundary, '-Wl,-map,' + str(OUT / 'NativeAdrenoMetal.map')]
+ pm4 = OUT / 'AdrenoPM4.o'
+ subprocess.run([*base, '-std=c11', '-c', ROOT / 'kits/AdrenoPM4/AdrenoPM4.c', '-o', pm4], check=True)
++# hakios-metal (MIT; drivers/AdrenoMetal/hakios-metal when the checkout carries it: the OnePlus 12R's native Metal backend for the A740,
++# stage 4): each source its own object (their file-local helpers share names), linked into the plugin, which tests it under HAKIOS_METAL_A740.
++HAKIOS = ROOT / 'drivers/AdrenoMetal/hakios-metal'
++hakios_objects, hakios_flags = [], []
++if HAKIOS.is_dir():
++    for source in sorted((HAKIOS / 'src').glob('*.cpp')):
++        obj = OUT / f'hakios-{source.stem}.o'
++        subprocess.run([*(['xcrun', 'clang++'] + base[2:]), '-std=c++17', '-I', HAKIOS / 'include', '-c', source, '-o', obj], check=True)
++        hakios_objects.append(obj)
++    hakios_flags = ['-DHAKIOS_METAL_A740', '-I', HAKIOS / 'include']
+ exe = code_dir / 'NativeAdrenoMetal'
+ # The OS image's .metallib paths (build/prime-list.txt, one per line), carried in the executable's __DATA,__primelist section as well: the
+ # render server's sandbox may refuse to read the list file beside the bundle, and the plugin then primes from this copy (PrimeShaders.h).
+@@ -88,8 +98,8 @@ PRIME_LIST = ROOT / 'build/prime-list.txt'
+ prime_section = [f'-Wl,-sectcreate,__DATA,__primelist,{PRIME_LIST}'] if PRIME_LIST.is_file() else []
+ subprocess.run([*(['xcrun', 'clang++'] + base[2:]), '-std=c++17', '-fobjc-arc', '-Wno-deprecated-declarations', '-bundle',
+                 '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
+-                '-x', 'objective-c++', ROOT / 'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm',
+-                ROOT / 'drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm', '-x', 'none', pm4, BRIDGE,
++                *hakios_flags, '-x', 'objective-c++', ROOT / 'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm',
++                ROOT / 'drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm', '-x', 'none', pm4, *hakios_objects, BRIDGE,
+                 *link_extra, '-Wl,-dead_strip', *prime_section, '-lobjc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface',
+                 # macOS: the device class subclasses IOGPU's IOGPUMetalDevice (the SDK's private IOGPU.tbd exports it) and the
+                 # IOGPU adapter (IOGPUMetalDeviceShim.h) keeps the accelerator port with IOKit.
