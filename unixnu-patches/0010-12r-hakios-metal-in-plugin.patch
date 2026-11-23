@@ -1,8 +1,16 @@
 diff --git a/scripts/build-adreno-metal-plugin.py b/scripts/build-adreno-metal-plugin.py
-index 8e17794..75e73b1 100644
+index 8e17794..05633aa 100644
 --- a/scripts/build-adreno-metal-plugin.py
 +++ b/scripts/build-adreno-metal-plugin.py
-@@ -81,6 +81,23 @@ if IOS27:
+@@ -7,6 +7,7 @@ trust.json with its CDHash. The bundle is staged into the Data seed by add-gpu-p
+ owner trust module (make-owner-trust-bundle.py); neither changes the original trust modules, AMFI or any Apple signature."""
+ import argparse
+ import hashlib
++import os
+ import json
+ import plistlib
+ import re
+@@ -81,6 +82,24 @@ if IOS27:
      link_extra = [boundary, '-Wl,-map,' + str(OUT / 'NativeAdrenoMetal.map')]
  pm4 = OUT / 'AdrenoPM4.o'
  subprocess.run([*base, '-std=c11', '-c', ROOT / 'kits/AdrenoPM4/AdrenoPM4.c', '-o', pm4], check=True)
@@ -15,7 +23,8 @@ index 8e17794..75e73b1 100644
 +hakios_objects, hakios_flags, hakios_mesa = [], [], []
 +if HAKIOS.is_dir():
 +    mesa_flags = []
-+    if (HAKIOS_MESA / 'stamp').is_file():
++    # HAKIOS_MESA_LINK=0 builds the plugin without them even when they are there (an A/B of the plugin with and without Mesa)
++    if (HAKIOS_MESA / 'stamp').is_file() and os.environ.get('HAKIOS_MESA_LINK', '1') != '0':
 +        mesa_flags = ['-DHAKIOS_METAL_MESA', *(HAKIOS_MESA / 'defs.txt').read_text().split(), *(HAKIOS_MESA / 'include.txt').read_text().split()]
 +        hakios_mesa = [*sorted((HAKIOS_MESA / 'lib').glob('*.a')), '-lz']
 +    for source in sorted((HAKIOS / 'src').glob('*.cpp')):
@@ -26,7 +35,7 @@ index 8e17794..75e73b1 100644
  exe = code_dir / 'NativeAdrenoMetal'
  # The OS image's .metallib paths (build/prime-list.txt, one per line), carried in the executable's __DATA,__primelist section as well: the
  # render server's sandbox may refuse to read the list file beside the bundle, and the plugin then primes from this copy (PrimeShaders.h).
-@@ -88,8 +105,8 @@ PRIME_LIST = ROOT / 'build/prime-list.txt'
+@@ -88,8 +107,8 @@ PRIME_LIST = ROOT / 'build/prime-list.txt'
  prime_section = [f'-Wl,-sectcreate,__DATA,__primelist,{PRIME_LIST}'] if PRIME_LIST.is_file() else []
  subprocess.run([*(['xcrun', 'clang++'] + base[2:]), '-std=c++17', '-fobjc-arc', '-Wno-deprecated-declarations', '-bundle',
                  '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
