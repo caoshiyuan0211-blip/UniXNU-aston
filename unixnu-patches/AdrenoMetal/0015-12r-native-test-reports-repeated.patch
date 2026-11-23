@@ -1,0 +1,43 @@
+diff --git a/NativeHakiosA740Test.h b/NativeHakiosA740Test.h
+index f58e259..d34fef1 100644
+--- a/NativeHakiosA740Test.h
++++ b/NativeHakiosA740Test.h
+@@ -25,6 +25,20 @@
+ #endif
+ 
+ namespace {
++// One report row, ended with " #xx" (the sum of its bytes before the mark, mod 256): the kernel keeps one text per process and the log
++// copies it every 2 s, so a row written while it is being copied comes out torn (12R boot 32: two rows interleaved). REPEAT copies,
++// 3 s apart, so a clean one is in the log, also after the process's own Turnip messages have replaced it.
++static void hakiosReport(Gpu &gpu, const char *text, int repeat) {
++    char row[64];
++    unsigned sum = 0;
++    for (const char *c = text; *c; ++c) sum += uint8_t(*c);
++    snprintf(row, sizeof row, "%.58s #%02x", text, sum & 0xff);
++    for (int i = 0; i < repeat; ++i) {
++        streamText(gpu, row);
++        if (i + 1 < repeat) sleep(3);
++    }
++}
++
+ static void a740HakiosTest(unsigned port) {
+     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+     if (!iokit) return;
+@@ -196,7 +210,7 @@ static void a740HakiosTest(unsigned port) {
+             // end and Mesa's ir3, for the A740), linked, then drawn and checked as above
+             if (why.empty()) {
+                 // left in the log if the compile takes the process down: the steps before it, and that it began
+-                {char t[64]; snprintf(t, sizeof t, "N hk v%u r%u d%u x%u compiling", right, raw, drawn, wrong); streamText(gpu, t);}
++                {char t[64]; snprintf(t, sizeof t, "N hk v%u r%u d%u x%u compiling", right, raw, drawn, wrong); hakiosReport(gpu, t, 1); sleep(3);}
+                 const uint64_t t0 = mach_continuous_time();
+                 std::string cwhy;
+                 std::shared_ptr<hm::CompiledStage> vs(hm::compileStage(hm::kernels::tri_color_vs_bc, sizeof hm::kernels::tri_color_vs_bc, &cwhy));
+@@ -255,7 +269,7 @@ static void a740HakiosTest(unsigned port) {
+     (void)rawFirst;
+     (void)worst; (void)firstWrong;
+     (void)first; (void)second; (void)step; (void)gpuNs;
+-    streamText(gpu, text);
++    hakiosReport(gpu, text, 4);
+     gpu.mark(right == 1024 && drawn == 128 * 96 ? 0x6eff : 0x6efe);
+ }
+ }  // namespace
