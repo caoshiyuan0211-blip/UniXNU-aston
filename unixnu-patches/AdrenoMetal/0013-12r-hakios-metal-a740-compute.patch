@@ -43,17 +43,17 @@ index b9127d4..ce7d586 100644
  }  // namespace
 diff --git a/NativeHakiosA740Test.h b/NativeHakiosA740Test.h
 new file mode 100644
-index 0000000..2ea0b3a
+index 0000000..f58e259
 --- /dev/null
 +++ b/NativeHakiosA740Test.h
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,261 @@
 +// SPDX-License-Identifier: MIT
 +// Native Metal stage 4a on the OnePlus 12R's A740 (boot argument native-a740-fill=1, after the stage 1-3 tests): hakios-metal's own
 +// driver (MIT, vendored as hakios-metal/: its command queue, command buffer and compute encoder, ported to a7xx) runs fill_id through
 +// the NativeAdreno user client (hakios's Transport over the same calls as the tests above). One report row:
 +//   N hk v<compute words right of 1024> r<stage 1's stream through the transport: words right> d<draw pixels right of 12288>
 +//        x<wrong pixels> m<largest channel error> q<first wrong pixel> <hakios's refusal, if any>
-+//   c<pixels right drawn with tri_color compiled on the phone> k<its compile ms> (stage 4c-2, with HAKIOS_METAL_A740_COMPILER)
++//   c<pixels right drawn with tri_color compiled on the phone (only with native-a740-cdraw=1)> w<words it compiled to (128 expected)> k<compile ms> (stage 4c-2, with HAKIOS_METAL_A740_COMPILER)
 +// Pass: v1024 r1024 d12288 x0 c12288 (stage 4b: hakios's draw on the A740 through its a7xx rewrite).
 +// Pass: v1024/1024 (every word holds gid * K + C, which only its own invocation writes).
 +// Included from NativeA740FillTest.h (Gpu, streamText).
@@ -114,7 +114,7 @@ index 0000000..2ea0b3a
 +    auto faultsNow = []() {NativeAdrenoAbiStatus st = {}; return gpu.method(NativeAdrenoMethodGetStatus, nullptr, 0, &st, sizeof st) == 0 ? st.faults : ~0ull;};
 +    unsigned drawn = 0, wrong = 0, worst = 0;   // stage 4b: pixels of the draw within 3 steps of their colour, the others, the largest error
 +    uint32_t firstWrong = 0;
-+    unsigned compiledRight = 0, compileMs = 0;   // stage 4c-2: pixels right drawn with tri_color compiled ON the phone (AIR -> ir3 for the A740), its compile time   // stage 1's stream through the transport: words right (8888 no buffers, 9999 submit or wait failed)   // what the GPU left in words 0 and 1 (0x55555555: nothing written)
++    unsigned compiledRight = 0, compileMs = 0, compiledWords = 0;   // stage 4c-2: pixels right drawn with tri_color compiled ON the phone (AIR -> ir3 for the A740), its compile time   // stage 1's stream through the transport: words right (8888 no buffers, 9999 submit or wait failed)   // what the GPU left in words 0 and 1 (0x55555555: nothing written)
 +    int64_t gpuNs = 0;
 +    std::string why;
 +    hm::setTargetChip(hm::kChipA740);
@@ -252,7 +252,12 @@ index 0000000..2ea0b3a
 +                std::shared_ptr<hm::CompiledStage> fs(vs ? hm::compileStage(hm::kernels::tri_color_fs_bc, sizeof hm::kernels::tri_color_fs_bc, &cwhy) : nullptr);
 +                auto linked = vs && fs ? hm::linkProgram(vs, fs, hm::PixelFormat::kRGBA8Unorm, &cwhy) : nullptr;
 +                compileMs = unsigned((mach_continuous_time() - t0) * timebase.numer / timebase.denom / 1000000);
-+                auto target2 = linked ? hm::Texture::make(device, td, &cwhy) : nullptr;
++                if (linked) compiledWords = linked->program.vs.k.numWords + linked->program.fs.k.numWords;
++                // the draw with it only with native-a740-cdraw=1 (12R boot 28: the GPU stopped at this test; compile and draw apart)
++                char bootArgs[1024] = {};
++                size_t bootSize = sizeof bootArgs - 1;
++                const bool drawCompiled = sysctlbyname("kern.bootargs", bootArgs, &bootSize, nullptr, 0) == 0 && strstr(bootArgs, "native-a740-cdraw=1");
++                auto target2 = linked && drawCompiled ? hm::Texture::make(device, td, &cwhy) : nullptr;
 +                if (target2 && target2->contents()) {
 +                    auto row2 = [&](unsigned y) {return reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(target2->contents()) + y * target2->bytesPerRow());};
 +                    for (unsigned y = 0; y < 96; ++y) for (unsigned x = 0; x < 128; ++x) row2(y)[x] = 0x55555555u;
@@ -284,7 +289,7 @@ index 0000000..2ea0b3a
 +                    } else if (why.empty()) {
 +                        why = "compiled draw: " + (ccb ? ccb->error() : std::string("no command buffer"));
 +                    }
-+                } else if (why.empty()) {
++                } else if (why.empty() && !linked) {
 +                    why = "compile: " + cwhy;
 +                }
 +            }
@@ -294,7 +299,7 @@ index 0000000..2ea0b3a
 +    char text[64];
 +    faults[3] = faultsNow();
 +    // f: the fault count's rise after the replay / the compute / the draw; a, b: word 0 of the replay's and the compute's output
-+    snprintf(text, sizeof text, "N hk v%u r%u d%u x%u c%u k%u f%u/%u/%u %s", right, raw, drawn, wrong, compiledRight, compileMs,
++    snprintf(text, sizeof text, "N hk v%u r%u d%u x%u c%u w%u k%u f%u/%u/%u %s", right, raw, drawn, wrong, compiledRight, compiledWords, compileMs,
 +             unsigned(faults[1] - faults[0]), unsigned(faults[2] - faults[1]), unsigned(faults[3] - faults[2]), why.c_str());
 +    (void)rawFirst;
 +    (void)worst; (void)firstWrong;
