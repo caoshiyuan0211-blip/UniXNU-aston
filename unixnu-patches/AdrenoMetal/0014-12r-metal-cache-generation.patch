@@ -1,0 +1,63 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 2335437..41bcadc 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -244,7 +244,7 @@ static id clientDevice(unsigned port) {
+         // and denied every write to <cache>/m2v, so each of its launches compiled every pipeline again and it was killed at its memory
+         // limit within seconds).
+         if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}
+-        if (i != 2) strlcat(candidates[i], "m2v", sizeof candidates[i]);
++        if (i != 2) {strlcat(candidates[i], "m2v", sizeof candidates[i]); strlcat(candidates[i], shaderCacheGeneration(), sizeof candidates[i]);}
+         mkdir(candidates[i], 0700);
+         if (access(candidates[i], W_OK) != 0) continue;
+         ++usable;
+@@ -514,7 +514,7 @@ static id deviceForPort(unsigned port) {
+             if (device) break;
+             if (!candidates[i][0]) continue;
+             if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}   // as for the clients below
+-            if (i != 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
++            if (i != 5) {strlcat(candidates[i], "m2v", sizeof candidates[i]); strlcat(candidates[i], shaderCacheGeneration(), sizeof candidates[i]);}
+             mkdir(candidates[i], 0700);
+             if (access(candidates[i], W_OK) != 0) continue;
+             // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
+diff --git a/SharedShaderCache.h b/SharedShaderCache.h
+index f02320e..3c743d6 100644
+--- a/SharedShaderCache.h
++++ b/SharedShaderCache.h
+@@ -1,5 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
++#include <sys/sysctl.h>
++#include <cstdlib>
++#include <cstring>
+ #include <string>
+ #include <pwd.h>
+ #include <unistd.h>
+@@ -9,6 +12,18 @@
+ 
+ // Processes of one user share immutable, version-keyed shader entries. A sandbox
+ // that cannot write this directory continues with its container's cache.
++// 12R: the boot argument metal-cache-gen=N renames every shader cache directory with ".genN" (the shared one and each process's m2v):
++// a boot with a new N starts from empty caches and leaves the earlier ones as they are, unused. Empty without the argument.
++inline const char *shaderCacheGeneration() {
++    static const std::string suffix = []() -> std::string {
++        char args[1024] = {};
++        size_t size = sizeof args - 1;
++        if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return {};
++        const char *at = strstr(args, "metal-cache-gen=");
++        return at ? ".gen" + std::to_string(atoi(at + 16)) : std::string();
++    }();
++    return suffix.c_str();
++}
+ inline std::string sharedShaderCacheDirectory() {
+     static const std::string path = []() -> std::string {
+         std::string root;
+@@ -19,7 +34,7 @@ inline std::string sharedShaderCacheDirectory() {
+             passwd user{}, *found=nullptr;
+             std::vector<char> bytes(16384);
+             if (getpwuid_r(getuid(), &user, bytes.data(), bytes.size(), &found) || !found || !user.pw_dir) return {};
+-            root = std::string(user.pw_dir) + "/Library/Caches/org.unixnu.metal";
++            root = std::string(user.pw_dir) + "/Library/Caches/org.unixnu.metal" + shaderCacheGeneration();
+         }
+         mkdir(root.c_str(), 0700);
+         struct stat st = {};

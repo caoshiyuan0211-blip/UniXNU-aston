@@ -222,8 +222,6 @@ jobs:
           # A new seed skips Setup but not the first-boot data migration (unixnu-patches/0002): the migration registers the
           # system apps and makes their app and group containers, which the iPadOS seed never got. The first boot is slow.
           UNIXNU_SEED_FIRST_BOOT_MIGRATION: "1"
-          # 12R stage 4c-2 A/B (boots 28/29 hung at ~140 s in every build with Mesa in the plugin): 0 builds it without.
-          HAKIOS_MESA_LINK: "0"
           # The Wi-Fi stack in the kernel (build-gop-legacy-display-27.py): room for its 75 KiB of __DATA comes from ShengUfs'
           # scratch buffer, now allocated at run time. Its firmware is not part of this build (root image object "Wifi").
           ASTON_WIFI: "1"
